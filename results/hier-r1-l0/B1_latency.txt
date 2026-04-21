@@ -1,0 +1,2 @@
+B1 — Packet processing latency
+n=5 mean=6.5156 stddev=0.6720 min=5.5240 max=7.2710

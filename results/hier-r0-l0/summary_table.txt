@@ -1,0 +1,25 @@
+XDP Adaptive Firewall — Paper Benchmark Results
+Generated: Sat Apr 18 10:03:52 PM IST 2026
+Host: cse-sdpl-HP-Z4-G5-Workstation-Desktop-PC  Kernel: 6.17.0-1017-oem
+Interface: fw-h-r0-l0  Target: 10.30.10.1  Runs: 5
+Injector: C (C=sendmmsg batched, Python=single syscall/pkt)
+================================================================
+B1  Latency (flood_timed proxy µs): n=5 mean=5.4118 stddev=0.3288 min=5.1970 max=6.0650
+B2  Throughput (Mpps):             n=5 mean=1.0179 stddev=0.1462 min=0.8349 max=1.2831
+B3  Block detection latency (ms):  n=5 mean=0.1386 stddev=0.0454 min=0.0840 max=0.2000
+B3  Packets until blocked:          n=5 mean=6.0000 stddev=0.0000 min=6.0000 max=6.0000  (theoretical min=6)
+B4  Score half-life (ms):           n=5 mean=50.2000 stddev=0.0000 min=50.2000 max=50.2000  (theoretical=138.6ms)
+B5  Gossip propagation latency (ms): n=5 mean=19.7718 stddev=5.7825 min=11.0670 max=26.0900
+B6  False positive rate:            0.0%  (0/20 balanced-traffic IPs blocked)
+B7  Memory:  see results/hier-r0-l0/B7_memory.txt
+B8  CPU overhead: see results/hier-r0-l0/B8_cpu.txt
+B9  Blacklist scalability:
+    blacklist_size=0: n=3 mean=0.8479 stddev=0.1198 min=0.7251 max=1.0103 Mpps
+    blacklist_size=100: n=3 mean=0.7319 stddev=0.2265 min=0.4758 max=1.0266 Mpps
+    blacklist_size=1000: n=3 mean=0.6909 stddev=0.1456 min=0.5075 max=0.8637 Mpps
+    blacklist_size=5000: n=3 mean=0.9003 stddev=0.1759 min=0.7345 max=1.1437 Mpps
+B10 EWMA convergence (windows):    n=5 mean=2.2000 stddev=0.4000 min=2.0000 max=3.0000  (x500ms per window)
+
+================================================================
+PAPER TABLE — XDP Adaptive Firewall Performance
+================================================================

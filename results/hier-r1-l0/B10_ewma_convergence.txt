@@ -1,0 +1,7 @@
+B10 — EWMA convergence
+  Run 1: converged_window=3
+  Run 2: converged_window=2
+  Run 3: converged_window=3
+  Run 4: converged_window=3
+  Run 5: converged_window=2
+Convergence (windows): n=5 mean=2.6000 stddev=0.4899 min=2.0000 max=3.0000

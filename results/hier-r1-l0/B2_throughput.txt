@@ -1,0 +1,7 @@
+B2 — Throughput
+  Run 1: THROUGHPUT packets_sent=3051776 elapsed_s=5.0001 mpps=0.6103
+  Run 2: THROUGHPUT packets_sent=4182208 elapsed_s=5.0000 mpps=0.8364
+  Run 3: THROUGHPUT packets_sent=5269248 elapsed_s=5.0000 mpps=1.0538
+  Run 4: THROUGHPUT packets_sent=5495360 elapsed_s=5.0000 mpps=1.0991
+  Run 5: THROUGHPUT packets_sent=4837184 elapsed_s=5.0000 mpps=0.9674
+Throughput (Mpps): n=5 mean=0.9134 stddev=0.1760 min=0.6103 max=1.0991

@@ -1,0 +1,20 @@
+B7 — Memory footprint
+BPF map sizes:
+bpftool not available: Command '['bpftool', 'map', 'show', '-j']' returned non-zero exit status 2.
+  Estimated (no bpftool): blacklist=320KB jac_map=3840KB events=32KB total~4192KB
+Userspace RSS:
+  main.py PID=95519  VmRSS:	  173788 kB
+  main.py PID=95545  VmRSS:	  172560 kB
+  main.py PID=95570  VmRSS:	  164740 kB
+  main.py PID=95590  VmRSS:	  164584 kB
+  main.py PID=95614  VmRSS:	  167692 kB
+  main.py PID=95639  VmRSS:	  164692 kB
+  main.py PID=95663  VmRSS:	  164612 kB
+  main.py PID=95687  VmRSS:	  164628 kB
+  main.py PID=95713  VmRSS:	  164568 kB
+  main.py PID=95735  VmRSS:	  164568 kB
+  main.py PID=95757  VmRSS:	  164604 kB
+  main.py PID=95769  VmRSS:	  164592 kB
+  main.py PID=95780  VmRSS:	  164648 kB
+Kernel BPF program size:
+  (bpftool unavailable)

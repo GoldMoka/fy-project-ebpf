@@ -1,0 +1,7 @@
+B4 — Score decay timing
+  Run 1: half_time_ms=50.2
+  Run 2: half_time_ms=50.2
+  Run 3: half_time_ms=50.2
+  Run 4: half_time_ms=50.2
+  Run 5: half_time_ms=50.2
+Score half-life (ms): n=5 mean=50.2000 stddev=0.0000 min=50.2000 max=50.2000

@@ -1,0 +1,7 @@
+B5 — Gossip propagation latency
+  Run 1: FOUND elapsed_ms=8.916
+  Run 2: FOUND elapsed_ms=17.454
+  Run 3: FOUND elapsed_ms=15.225
+  Run 4: FOUND elapsed_ms=49.274
+  Run 5: FOUND elapsed_ms=37.860
+Gossip latency (ms): n=5 mean=25.7458 stddev=15.2513 min=8.9160 max=49.2740

@@ -1,0 +1,4 @@
+B8 — CPU overhead
+  idle (no test traffic): sys_cpu=1.5% (n=6 samples)
+  moderate load (~500pps): sys_cpu=1.8% (n=6 samples)
+  SYN flood (max rate): sys_cpu=2.3% (n=6 samples)

@@ -1,0 +1,5 @@
+B9 — Blacklist scalability
+  blacklist_size=0: n=3 mean=0.9407 stddev=0.1067 min=0.7970 max=1.0524 Mpps
+  blacklist_size=100: n=3 mean=0.9695 stddev=0.1712 min=0.7274 max=1.0931 Mpps
+  blacklist_size=1000: n=3 mean=1.0711 stddev=0.0764 min=0.9671 max=1.1486 Mpps
+  blacklist_size=5000: n=3 mean=0.8114 stddev=0.1144 min=0.6717 max=0.9519 Mpps

@@ -1,0 +1,7 @@
+B3 — Block detection latency
+  Run 1: FOUND elapsed_ms=2.141
+  Run 2: FOUND elapsed_ms=0.083
+  Run 3: FOUND elapsed_ms=0.147
+  Run 4: FOUND elapsed_ms=0.155
+  Run 5: FOUND elapsed_ms=0.151
+Detection latency (ms): n=5 mean=0.5354 stddev=0.8032 min=0.0830 max=2.1410
