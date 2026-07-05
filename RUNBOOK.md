@@ -70,7 +70,7 @@ PART 1 — START THE FIREWALL CLUSTER
 Option A — Automatic (recommended)
 ────────────────────────────────────
   sudo bash veth_setup.sh start <topology>
-  # Example: sudo bash veth_setup.sh start hierarchical
+  # Example: sudo bash veth_setup.sh start simple/ring-8/hierarchical
 
   This command:
     1. Prompts for an HMAC key (or auto-generates one if you press Enter).
