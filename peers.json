@@ -1,0 +1,6 @@
+{
+  "topology": "star",
+  "role": "coordinator",
+  "peers": ["127.0.0.1"],
+  "coordinator": "127.0.0.1"
+}

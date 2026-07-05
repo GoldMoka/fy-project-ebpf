@@ -11,10 +11,19 @@ PART 0 — ONE-TIME MACHINE SETUP
 
 Step 0.1  Install all dependencies
 ────────────────────────────────────
+  sudo apt update
   sudo bash install_and_run.sh --install-only
 
   Also install benchmark extras:
-  sudo apt install -y bpftool bc gcc arping hping3 tmux
+  sudo apt install -y bc gcc arping hping3 tmux
+
+Ubuntu packages `bpftool` as part of the kernel tools package. Install the version that matches your running kernel:
+
+  sudo apt install -y linux-tools-$(uname -r)
+
+Verify the bpf version
+
+  bpftool --version
 
   Verify kernel headers (required for BPF compilation):
   ls /lib/modules/$(uname -r)/build
