@@ -224,8 +224,14 @@ fn = b.load_func("xdp_firewall_prog", BPF.XDP)
 
 # ── XDP attach ─────────────────────────────────────────────────────────────────
 def _attach_xdp(iface, mode_pref):
-    native_flag  = BPF.XDP_FLAGS_DRV_MODE
-    generic_flag = BPF.XDP_FLAGS_SKB_MODE
+    # Compatibility with older BCC versions
+    XDP_FLAGS_UPDATE_IF_NOEXIST = getattr(BPF, "XDP_FLAGS_UPDATE_IF_NOEXIST", 1)
+    XDP_FLAGS_SKB_MODE          = getattr(BPF, "XDP_FLAGS_SKB_MODE", 2)
+    XDP_FLAGS_DRV_MODE          = getattr(BPF, "XDP_FLAGS_DRV_MODE", 4)
+
+    native_flag = XDP_FLAGS_DRV_MODE
+    generic_flag = XDP_FLAGS_SKB_MODE
+    
 
     if mode_pref == "native":
         try:
