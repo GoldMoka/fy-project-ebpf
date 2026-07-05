@@ -417,7 +417,7 @@ do_teardown() {
 do_status() {
     echo -e "${CYN}Interface        IPv4                  State    XDP${NC}"
     echo    "─────────────────────────────────────────────────────────"
-    for iface in $(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+:/{print $2}' \
+    for iface in $(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+:/ {sub(/@.*/, "", $2); print $2}' \
                    | grep -E '^(fw|coord)' | sort); do
         local st ip4 xdp
         st=$(ip link show "$iface" 2>/dev/null | awk '/state/{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' | head -1)
@@ -711,8 +711,18 @@ do_start() {
         die "No nodes defined for topology '$t'"
     fi
 
-    # ── tmux path ─────────────────────────────────────────────────────────────
+    # Ask whether to use tmux (if available)
+    local USE_TMUX=0
     if command -v tmux &>/dev/null; then
+        echo ""
+        read -r -p "Use tmux? [Y/n] " ans
+        if [[ "${ans,,}" != "n" ]]; then
+            USE_TMUX=1
+        fi
+    fi
+
+    # ── tmux path ─────────────────────────────────────────────────────────────
+    if [[ $USE_TMUX -eq 1 ]]; then
         local SESSION="xdp_${t}"
         # Kill any existing session with this name
         tmux kill-session -t "$SESSION" 2>/dev/null || true
