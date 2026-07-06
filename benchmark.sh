@@ -558,7 +558,13 @@ else
     LATENCIES=()
     for i in $(seq 1 $RUNS); do
         PROBE_IP="10.253.${i}.1"
-        rtt=$(hping3 -S -p 8080 -c 20 --fast -a "$PROBE_IP" -I "$IFACE" "$TARGET_IP" 2>&1 | awk -F'[=/ ]' '/round-trip/{print $NF}' | head -1)
+        rtt=$(
+    {
+        hping3 -S -p 8080 -c 20 --fast \
+            -a "$PROBE_IP" -I "$IFACE" "$TARGET_IP" 2>&1 || true
+    } |
+    sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\).*/\2/p'
+)
         rtt_us=$(python3 -c "print(f'{float(\"${rtt:-0}\")*1000:.1f}')" 2>/dev/null || echo "0")
         LATENCIES+=("$rtt_us")
         info "  Run $i: RTT = ${rtt:-N/A} ms  (${rtt_us} µs)"
