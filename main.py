@@ -305,7 +305,7 @@ def _pin_maps():
     print(f"[!] Map pinning failed completely.")
     print(f"    Fix: sudo mount -t bpf bpf /sys/fs/bpf")
 
-_pin_maps()
+# _pin_maps()
 
 # ── Gossip send ────────────────────────────────────────────────────────────────
 _gossip_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

@@ -13,6 +13,9 @@
 #
 #  Tests execute from attacker_ns using atk0/atk1/atk2.
 # =============================================================================
+echo "=== DEBUG ==="
+ip netns list
+echo "============="
 
 set -euo pipefail
 
@@ -56,11 +59,18 @@ for i in 0 1 2; do
     ns="fw${i}_ns"
     iface="fw${i}"
 
-    ip netns list | grep -q "^${ns}$" || {
-        echo "Namespace ${ns} not found."
-        echo "Run: sudo bash veth_setup.sh setup simple"
-        exit 1
-    }
+    # ip netns list | grep -q "^${ns}$" || {
+    #     echo "Namespace ${ns} not found."
+    #     echo "Run: sudo bash veth_setup.sh setup simple"
+    #     exit 1
+    # }
+
+    ip netns list | awk '{print $1}' | grep -qx "$ns" || {
+    echo "Namespace ${ns} not found."
+    echo "Run: sudo bash veth_setup.sh setup simple"
+    exit 1
+}
+
 
     ip netns exec "$ns" ip link show "$iface" &>/dev/null || {
         echo "Interface ${iface} missing inside ${ns}"
@@ -69,7 +79,7 @@ for i in 0 1 2; do
 
 done
 
-ip netns list | grep -q "^${ATTACKER_NAMESPACE}$" || {
+ip netns list | awk '{print $1}' | grep -qx "$ATTACKER_NAMESPACE" || {
     echo "Namespace ${ATTACKER_NAMESPACE} not found."
     echo "Run: sudo bash veth_setup.sh setup simple"
     exit 1

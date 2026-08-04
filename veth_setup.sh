@@ -138,18 +138,56 @@ make_veth() {
 
 # make_backbone <iface_a> <cidr_a> <iface_b> <cidr_b>
 # Both ends in root ns — for inter-node gossip backbone links
+# make_backbone() {
+#     local a="$1" a_cidr="$2" b="$3" b_cidr="$4"
+#     if ip link show "$a" &>/dev/null; then
+#         warn "  backbone $a already exists — skipping"; return
+#     fi
+#     ip link add "$a" type veth peer name "$b"
+#     ip addr add "$a_cidr" dev "$a"
+#     ip addr add "$b_cidr" dev "$b"
+#     ip link set "$a" up
+#     ip link set "$b" up
+#     ethtool -K "$a" rx-checksumming off tx-checksumming off gso off gro off 2>/dev/null || true
+#     ok "  backbone $a ($a_cidr) <---> $b ($b_cidr)"
+# }
+
 make_backbone() {
-    local a="$1" a_cidr="$2" b="$3" b_cidr="$4"
+
+    local ns_a="$1"
+    local a="$2"
+    local a_cidr="$3"
+
+    local ns_b="$4"
+    local b="$5"
+    local b_cidr="$6"
+
     if ip link show "$a" &>/dev/null; then
-        warn "  backbone $a already exists — skipping"; return
+        warn "  backbone $a already exists — skipping"
+        return
     fi
+
     ip link add "$a" type veth peer name "$b"
-    ip addr add "$a_cidr" dev "$a"
-    ip addr add "$b_cidr" dev "$b"
-    ip link set "$a" up
-    ip link set "$b" up
-    ethtool -K "$a" rx-checksumming off tx-checksumming off gso off gro off 2>/dev/null || true
-    ok "  backbone $a ($a_cidr) <---> $b ($b_cidr)"
+
+    # Move each end into its coordinator namespace
+    ip link set "$a" netns "$ns_a"
+    ip link set "$b" netns "$ns_b"
+
+    ip netns exec "$ns_a" ip addr add "$a_cidr" dev "$a"
+    ip netns exec "$ns_b" ip addr add "$b_cidr" dev "$b"
+
+    ip netns exec "$ns_a" ip link set "$a" up
+    ip netns exec "$ns_b" ip link set "$b" up
+
+    ip netns exec "$ns_a" ethtool -K "$a" \
+        rx-checksumming off tx-checksumming off \
+        gso off gro off 2>/dev/null || true
+
+    ip netns exec "$ns_b" ethtool -K "$b" \
+        rx-checksumming off tx-checksumming off \
+        gso off gro off 2>/dev/null || true
+
+    ok "  backbone $a@$ns_a ($a_cidr) <---> $b@$ns_b ($b_cidr)"
 }
 
 del_if() { ip link del "$1" 2>/dev/null && ok "  Removed $1" || true; }
@@ -178,7 +216,10 @@ setup_simple() {
     make_veth fw0_ns fw0 10.0.0.1/24  atk0 10.0.0.99/24
     make_veth fw1_ns fw1 10.0.1.1/24  atk1 10.0.1.99/24
     make_veth fw2_ns fw2 10.0.2.1/24  atk2 10.0.2.99/24
-    make_backbone coord0 10.99.0.1/30  coord1 10.99.0.2/30
+    # make_backbone coord0 10.99.0.1/30  coord1 10.99.0.2/30
+    make_backbone \
+    fw0_ns coord0 10.99.0.1/30 \
+    fw1_ns coord1 10.99.0.2/30
     sysctl_net
     write_peers "$SCRIPT_DIR/peers_coord0.json" \
         '{"role":"coordinator","coordinator_peers":["10.99.0.2"],"peers":["10.0.1.1","10.0.2.1"]}'
