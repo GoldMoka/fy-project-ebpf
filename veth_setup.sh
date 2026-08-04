@@ -229,8 +229,26 @@ setup_simple() {
         '{"role":"leaf","coordinators":["10.0.0.1","10.99.0.2"],"coordinator":"10.0.0.1"}'
     ok "simple ready — benchmark target: fw0 / 10.0.0.1"
 }
+# teardown_simple() {
+#     for i in fw0 fw1 fw2 coord0 coord1; do del_if $i; done
+# }
+
 teardown_simple() {
-    for i in fw0 fw1 fw2 coord0 coord1; do del_if $i; done
+    # Remove veth interfaces
+    for i in fw0 fw1 fw2 coord0 coord1; do
+        del_if "$i"
+    done
+
+    # Delete network namespaces
+    for ns in fw0_ns fw1_ns fw2_ns attacker_ns; do
+        if ip netns list | grep -qw "$ns"; then
+            # Kill any remaining processes in the namespace
+            ip netns pids "$ns" | xargs -r kill -9
+
+            # Delete the namespace
+            ip netns del "$ns"
+        fi
+    done
 }
 
 # =============================================================================
