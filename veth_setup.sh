@@ -55,41 +55,85 @@ die()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 CMD="${1:-setup}"
 TOPO="${2:-simple}"
-NETNS="xdp_attacker"
+# NETNS="xdp_attacker"
+FIREWALL_NAMESPACES=(
+    "fw0_ns"
+    "fw1_ns"
+    "fw2_ns"
+)
+
+ATTACKER_NAMESPACE="attacker_ns"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =============================================================================
 #  Low-level helpers
 # =============================================================================
 
-ensure_netns() {
-    if ! ip netns list | grep -q "^${NETNS}"; then
-        ip netns add "$NETNS"
-        ip netns exec "$NETNS" ip link set lo up
-        ok "Created netns: $NETNS"
+# ensure_namespaces() {
+#     if ! ip netns list | grep -q "^${NETNS}"; then
+#         ip netns add "$NETNS"
+#         ip netns exec "$NETNS" ip link set lo up
+#         ok "Created netns: $NETNS"
+#     fi
+# }
+
+ensure_namespaces() {
+
+    # Create firewall namespaces
+    for ns in "${FIREWALL_NAMESPACES[@]}"; do
+        if ! ip netns list | grep -q "^${ns}$"; then
+            ip netns add "$ns"
+            ip netns exec "$ns" ip link set lo up
+            ok "Created namespace: $ns"
+        fi
+    done
+
+    # Create attacker namespace
+    if ! ip netns list | grep -q "^${ATTACKER_NAMESPACE}$"; then
+        ip netns add "$ATTACKER_NAMESPACE"
+        ip netns exec "$ATTACKER_NAMESPACE" ip link set lo up
+        ok "Created namespace: $ATTACKER_NAMESPACE"
     fi
 }
+
 
 # make_veth <fw_iface> <fw_cidr> <atk_iface> <atk_cidr>
 # fw stays in root ns (XDP attached here), atk goes into NETNS (injector runs here)
 make_veth() {
-    local fw="$1" fw_cidr="$2" atk="$3" atk_cidr="$4"
+    # local fw="$1" fw_cidr="$2" atk="$3" atk_cidr="$4"
+    local fw_ns="$1"
+    local fw="$2"
+    local fw_cidr="$3"
+    local atk="$4"
+    local atk_cidr="$5"
     if ip link show "$fw" &>/dev/null; then
         warn "  $fw already exists — skipping"
         return
     fi
     ip link add "$fw" type veth peer name "$atk"
-    ip link set "$atk" netns "$NETNS"
-    ip addr add "$fw_cidr"  dev "$fw"
-    ip link set "$fw" up
-    ip netns exec "$NETNS" ip addr add "$atk_cidr" dev "$atk"
-    ip netns exec "$NETNS" ip link set "$atk" up
+    ip link set "$fw" netns "$fw_ns"
+    ip link set "$atk" netns "$ATTACKER_NAMESPACE"
+    # ip addr add "$fw_cidr"  dev "$fw"
+    # ip link set "$fw" up
+    ip netns exec "$fw_ns" ip link set lo up
+    ip netns exec "$fw_ns" ip addr add "$fw_cidr" dev "$fw"
+    ip netns exec "$fw_ns" ip link set "$fw" up
+    ip netns exec "$ATTACKER_NAMESPACE" ip addr add "$atk_cidr" dev "$atk"
+    ip netns exec "$ATTACKER_NAMESPACE" ip link set "$atk" up
     local base
     base=$(python3 -c "import ipaddress; print(str(ipaddress.ip_network('$fw_cidr',strict=False)))" 2>/dev/null \
           || echo "${fw_cidr%.*}.0/24")
-    ip netns exec "$NETNS" ip route add "$base" dev "$atk" 2>/dev/null || true
-    ethtool -K "$fw" rx-checksumming off tx-checksumming off gso off gro off 2>/dev/null || true
-    ok "  $fw ($fw_cidr) <--veth--> $atk@$NETNS ($atk_cidr)"
+    ip netns exec "$ATTACKER_NAMESPACE" ip route add "$base" dev "$atk" 2>/dev/null || true
+    # ethtool -K "$fw" rx-checksumming off tx-checksumming off gso off gro off 2>/dev/null || true
+    ip netns exec "$fw_ns" \
+    ethtool -K "$fw" \
+    rx-checksumming off \
+    tx-checksumming off \
+    gso off \
+    gro off \
+    2>/dev/null || true
+    # ok "  $fw ($fw_cidr) <--veth--> $atk@$ATTACKER_NAMESPACE ($atk_cidr)"
+    ok "  $fw@$fw_ns ($fw_cidr) <--veth--> $atk@$ATTACKER_NAMESPACE ($atk_cidr)"
 }
 
 # make_backbone <iface_a> <cidr_a> <iface_b> <cidr_b>
@@ -127,10 +171,13 @@ sysctl_net() {
 # =============================================================================
 setup_simple() {
     hdr "simple — fw0+fw1 coordinators, fw2 leaf"
-    ensure_netns
-    make_veth fw0 10.0.0.1/24  atk0 10.0.0.99/24
-    make_veth fw1 10.0.1.1/24  atk1 10.0.1.99/24
-    make_veth fw2 10.0.2.1/24  atk2 10.0.2.99/24
+    ensure_namespaces
+    # make_veth fw0 10.0.0.1/24  atk0 10.0.0.99/24
+    # make_veth fw1 10.0.1.1/24  atk1 10.0.1.99/24
+    # make_veth fw2 10.0.2.1/24  atk2 10.0.2.99/24
+    make_veth fw0_ns fw0 10.0.0.1/24  atk0 10.0.0.99/24
+    make_veth fw1_ns fw1 10.0.1.1/24  atk1 10.0.1.99/24
+    make_veth fw2_ns fw2 10.0.2.1/24  atk2 10.0.2.99/24
     make_backbone coord0 10.99.0.1/30  coord1 10.99.0.2/30
     sysctl_net
     write_peers "$SCRIPT_DIR/peers_coord0.json" \
@@ -158,7 +205,7 @@ teardown_simple() {
 # =============================================================================
 setup_star_large() {
     hdr "star-large — 1 coordinator + 8 leaves"
-    ensure_netns
+    ensure_namespaces
     # Coordinator: dummy interface in root ns, no attacker side needed
     if ! ip link show fw-star-coord &>/dev/null; then
         ip link add fw-star-coord type dummy 2>/dev/null || true
@@ -199,7 +246,7 @@ teardown_star_large() {
 # =============================================================================
 setup_ring_8() {
     hdr "ring-8 — 8-node gossip ring"
-    ensure_netns
+    ensure_namespaces
     local ips=()
     for i in $(seq 0 7); do
         make_veth "fw-ring-${i}" "10.20.${i}.1/24" "atk-ring-${i}" "10.20.${i}.99/24"
@@ -240,7 +287,7 @@ teardown_ring_8() {
 LEAF_BASES=(10 20 30)
 setup_hierarchical() {
     hdr "hierarchical — global + 3 racks + 9 leaves = 13 nodes"
-    ensure_netns
+    ensure_namespaces
     # Tier-0: global coordinator (dummy iface — pure relay)
     if ! ip link show fw-h-global &>/dev/null; then
         ip link add fw-h-global type dummy 2>/dev/null || true
@@ -301,7 +348,7 @@ teardown_hierarchical() {
 # =============================================================================
 setup_mesh_6() {
     hdr "mesh-6 — 6-node full mesh"
-    ensure_netns
+    ensure_namespaces
     local ips=()
     for i in $(seq 0 5); do
         make_veth "fw-mesh-${i}" "10.40.${i}.1/24" "atk-mesh-${i}" "10.40.${i}.99/24"
@@ -339,7 +386,7 @@ teardown_mesh_6() {
 # =============================================================================
 setup_multi_ring() {
     hdr "multi-ring — relay + ring-A(4) + ring-B(4) = 9 nodes"
-    ensure_netns
+    ensure_namespaces
     make_veth fw-mr-relay 10.50.0.1/24  atk-mr-relay 10.50.0.99/24
     local a_ips=() b_ips=()
     for i in 0 1 2 3; do
@@ -408,7 +455,12 @@ do_teardown() {
         all)
             teardown_simple; teardown_star_large; teardown_ring_8
             teardown_hierarchical; teardown_mesh_6; teardown_multi_ring
-            ip netns del "$NETNS" 2>/dev/null && ok "Removed netns $NETNS" || true ;;
+            # ip netns del "$NETNS" 2>/dev/null && ok "Removed netns $NETNS" || true ;;
+            for ns in "${FIREWALL_NAMESPACES[@]}"; do
+                ip netns del "$ns" 2>/dev/null || true
+            done
+
+            ip netns del "$ATTACKER_NAMESPACE" 2>/dev/null || true ;;
         *) die "Unknown topology: $1" ;;
     esac
     ok "Teardown complete."
@@ -426,10 +478,17 @@ do_status() {
         printf "%-22s %-22s %-8s %s\n" "$iface" "${ip4:--}" "${st:--}" "${xdp:--}"
     done
     echo ""
-    echo -e "${CYN}Attacker netns (${NETNS}):${NC}"
-    if ip netns list | grep -q "^${NETNS}"; then
-        ip netns exec "$NETNS" ip -4 addr show 2>/dev/null | awk '/inet /{print "  "$2}' | head -50
-    else echo "  (not running)"; fi
+    # echo -e "${CYN}Attacker netns (${NETNS}):${NC}"
+    # if ip netns list | grep -q "^${NETNS}"; then
+    #     ip netns exec "$NETNS" ip -4 addr show 2>/dev/null | awk '/inet /{print "  "$2}' | head -50
+    # else echo "  (not running)"; fi
+    echo -e "${CYN}Attacker netns (${ATTACKER_NAMESPACE}):${NC}"
+    if ip netns list | grep -q "^${ATTACKER_NAMESPACE}$"; then
+        ip netns exec "$ATTACKER_NAMESPACE" ip -4 addr show 2>/dev/null | \
+            awk '/inet /{print "  "$2}' | head -50
+    else
+        echo "  (not running)"
+    fi
     echo ""
     echo -e "${CYN}BPF map pins:${NC}"
     find /sys/fs/bpf/ -name "blacklist" -o -name "jac_map" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
@@ -446,15 +505,15 @@ do_launch() {
     simple)
         cat << EOF
   # T1 — fw0 (coordinator)
-  sudo python3 main.py --iface fw0 --port 5000 --peer-port 5001 \\
+  sudo ip netns exec fw0_ns python3 main.py --iface fw0 --port 5000 --peer-port 5001 \\
        --topology star --peers-file peers_coord0.json --xdp-mode native --hmac-key \$KEY
 
   # T2 — fw1 (coordinator)
-  sudo python3 main.py --iface fw1 --port 5001 --peer-port 5000 \\
+  sudo ip netns exec fw1_ns python3 main.py --iface fw1 --port 5001 --peer-port 5000 \\
        --topology star --peers-file peers_coord1.json --xdp-mode native --hmac-key \$KEY
 
   # T3 — fw2 (leaf)
-  sudo python3 main.py --iface fw2 --port 5002 --peer-port 5000 \\
+  sudo ip netns exec fw2_ns python3 main.py --iface fw2 --port 5002 --peer-port 5000 \\
        --topology star --peers-file peers_fw2.json --xdp-mode native --hmac-key \$KEY
 
   # T4 — monitor
