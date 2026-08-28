@@ -120,16 +120,34 @@ REPLAY_WINDOW_S: float = 30.0
 _SEEN_NONCES: dict = {}   # nonce -> expiry_time
 _NONCE_LOCK = threading.Lock()
 
-def _sign_gossip(ip_str: str) -> bytes:
+def _sign_gossip(ip_str: str, ttl=None, origin="") -> bytes:
     ts    = time.time()
     nonce = secrets.token_hex(8)
+
     if HMAC_KEY:
         body = f"{ip_str}:{ts:.6f}:{nonce}"
-        sig  = _hmac.new(HMAC_KEY, body.encode(), hashlib.sha256).hexdigest()
+        sig  = _hmac.new(
+            HMAC_KEY,
+            body.encode(),
+            hashlib.sha256
+        ).hexdigest()
     else:
-        sig  = ""
-    msg = json.dumps({"ip": ip_str, "ts": ts, "nonce": nonce, "sig": sig})
-    return msg.encode()
+        sig = ""
+
+    msg = {
+        "ip": ip_str,
+        "ts": ts,
+        "nonce": nonce,
+        "sig": sig
+    }
+
+    if ttl is not None:
+        msg["ttl"] = ttl
+
+    if origin:
+        msg["origin"] = origin
+
+    return json.dumps(msg).encode()
 
 def _verify_gossip(raw: str):
     """Returns (ip_str, ok:bool)"""
@@ -352,10 +370,21 @@ def send_gossip(ip_str, origin=""):
                     _send_to(coord_ip, args.peer_port, payload, "star[leaf→coord]")
 
     elif TOPOLOGY == "ring":
-        next_ip   = peer_config.get("next", "127.0.0.1")
+        next_ip = peer_config.get("next", "127.0.0.1")
         ring_size = peer_config.get("ring_size", 8)
-        _send_to(next_ip, args.peer_port, _sign_gossip(ip_str), "ring→next")
 
+        payload = _sign_gossip(
+            ip_str,
+            ttl=ring_size,
+            origin=_own_ips().pop() if _own_ips() else ""
+        )
+
+        _send_to(
+            next_ip,
+            args.peer_port,
+            payload,
+            "ring→next"
+        )
     elif TOPOLOGY == "hierarchical":
         rack = peer_config.get("rack_coordinator", "127.0.0.1")
         _send_to(rack, args.peer_port, payload, "hierarchical→rack")
@@ -419,8 +448,20 @@ def gossip_listener():
                             _seen_ips.clear()
                     if ttl > 1:
                         next_ip = peer_config.get("next", "127.0.0.1")
-                        fwd = json.dumps({"ip": malicious_ip, "ttl": ttl-1, "origin": origin})
-                        _gossip_sock.sendto(fwd.encode(), (next_ip, args.peer_port))
+                        fwd = _sign_gossip(
+                            malicious_ip,
+                            ttl=ttl - 1,
+                            origin=origin
+                        )
+                        _send_to(
+                            next_ip,
+                            args.peer_port,
+                            fwd,
+                            "ring→next[fwd]"
+                        )
+                        # next_ip = peer_config.get("next", "127.0.0.1")
+                        # fwd = json.dumps({"ip": malicious_ip, "ttl": ttl-1, "origin": origin})
+                        # _gossip_sock.sendto(fwd.encode(), (next_ip, args.peer_port))
                 except (json.JSONDecodeError, KeyError):
                     pass
 
