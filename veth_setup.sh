@@ -153,7 +153,6 @@ make_veth() {
 # }
 
 make_backbone() {
-
     local ns_a="$1"
     local a="$2"
     local a_cidr="$3"
@@ -162,33 +161,46 @@ make_backbone() {
     local b="$5"
     local b_cidr="$6"
 
-    if ip link show "$a" &>/dev/null; then
-        warn "  backbone $a already exists — skipping"
+    # Check inside the source namespace, since the interface may
+    # already have been moved out of the root namespace.
+    if ip netns exec "$ns_a" ip link show "$a" &>/dev/null; then
+        warn "  backbone $a@$ns_a already exists — skipping"
         return
     fi
 
+    # Create the veth pair in the root namespace first.
     ip link add "$a" type veth peer name "$b"
 
-    # Move each end into its coordinator namespace
+    # Move each end into its respective namespace.
     ip link set "$a" netns "$ns_a"
     ip link set "$b" netns "$ns_b"
 
+    # Configure addresses.
     ip netns exec "$ns_a" ip addr add "$a_cidr" dev "$a"
     ip netns exec "$ns_b" ip addr add "$b_cidr" dev "$b"
 
+    # Bring interfaces up.
     ip netns exec "$ns_a" ip link set "$a" up
     ip netns exec "$ns_b" ip link set "$b" up
 
+    # Disable offloading for predictable packet/XDP behaviour.
     ip netns exec "$ns_a" ethtool -K "$a" \
-        rx-checksumming off tx-checksumming off \
-        gso off gro off 2>/dev/null || true
+        rx-checksumming off \
+        tx-checksumming off \
+        gso off \
+        gro off \
+        2>/dev/null || true
 
     ip netns exec "$ns_b" ethtool -K "$b" \
-        rx-checksumming off tx-checksumming off \
-        gso off gro off 2>/dev/null || true
+        rx-checksumming off \
+        tx-checksumming off \
+        gso off \
+        gro off \
+        2>/dev/null || true
 
     ok "  backbone $a@$ns_a ($a_cidr) <---> $b@$ns_b ($b_cidr)"
 }
+
 
 del_if() { ip link del "$1" 2>/dev/null && ok "  Removed $1" || true; }
 
@@ -207,35 +219,74 @@ sysctl_net() {
 #  TOPOLOGY: simple
 #  fw0 (coord) + fw1 (coord) + fw2 (leaf) + coord0/coord1 backbone
 # =============================================================================
+# =============================================================================
 setup_simple() {
     hdr "simple — fw0+fw1 coordinators, fw2 leaf"
     ensure_namespaces
-    # make_veth fw0 10.0.0.1/24  atk0 10.0.0.99/24
-    # make_veth fw1 10.0.1.1/24  atk1 10.0.1.99/24
-    # make_veth fw2 10.0.2.1/24  atk2 10.0.2.99/24
-    make_veth fw0_ns fw0 10.0.0.1/24  atk0 10.0.0.99/24
-    make_veth fw1_ns fw1 10.0.1.1/24  atk1 10.0.1.99/24
-    make_veth fw2_ns fw2 10.0.2.1/24  atk2 10.0.2.99/24
-    # make_backbone coord0 10.99.0.1/30  coord1 10.99.0.2/30
+
+    # Firewall ↔ attacker links
+    make_veth fw0_ns fw0 10.0.0.1/24 atk0 10.0.0.99/24
+    make_veth fw1_ns fw1 10.0.1.1/24 atk1 10.0.1.99/24
+    make_veth fw2_ns fw2 10.0.2.1/24 atk2 10.0.2.99/24
+
+    # fw0 ↔ fw1 coordinator backbone
     make_backbone \
-    fw0_ns coord0 10.99.0.1/30 \
-    fw1_ns coord1 10.99.0.2/30
+        fw0_ns coord0 10.99.0.1/30 \
+        fw1_ns coord1 10.99.0.2/30
+
+    # fw0 ↔ fw2 coordinator/leaf backbone
+    make_backbone \
+        fw0_ns coord2 10.99.1.1/30 \
+        fw2_ns coord3 10.99.1.2/30
+
+    # -------------------------------------------------------------------------
+    # Routing between the two backbone networks
+    #
+    # fw1 reaches fw2 through fw0:
+    #   fw1 (10.99.0.2)
+    #       ↓
+    #   fw0 (10.99.0.1)
+    #       ↓
+    #   fw2 (10.99.1.2)
+    #
+    # fw2 reaches fw1 through fw0:
+    #   fw2 (10.99.1.2)
+    #       ↓
+    #   fw0 (10.99.1.1)
+    #       ↓
+    #   fw1 (10.99.0.2)
+    # -------------------------------------------------------------------------
+
+    ip netns exec fw1_ns ip route replace \
+        10.99.1.0/30 via 10.99.0.1 dev coord1
+
+    ip netns exec fw2_ns ip route replace \
+        10.99.0.0/30 via 10.99.1.1 dev coord3
+
     sysctl_net
+
+    # -------------------------------------------------------------------------
+    # Gossip peer configuration
+    #
+    # Gossip uses the 10.99.x.x backbone addresses, not the 10.0.x.x
+    # attacker/firewall addresses.
+    # -------------------------------------------------------------------------
+
     write_peers "$SCRIPT_DIR/peers_coord0.json" \
-        '{"role":"coordinator","coordinator_peers":["10.99.0.2"],"peers":["10.0.1.1","10.0.2.1"]}'
+        '{"role":"coordinator","coordinator_peers":["10.99.0.2"],"peers":["10.99.0.2","10.99.1.2"]}'
+
     write_peers "$SCRIPT_DIR/peers_coord1.json" \
-        '{"role":"coordinator","coordinator_peers":["10.99.0.1"],"peers":["10.0.0.1","10.0.2.1"]}'
+        '{"role":"coordinator","coordinator_peers":["10.99.0.1"],"peers":["10.99.0.1","10.99.1.2"]}'
+
     write_peers "$SCRIPT_DIR/peers_fw2.json" \
-        '{"role":"leaf","coordinators":["10.0.0.1","10.99.0.2"],"coordinator":"10.0.0.1"}'
+        '{"role":"leaf","coordinators":["10.99.1.1"],"coordinator":"10.99.1.1"}'
+
     ok "simple ready — benchmark target: fw0 / 10.0.0.1"
 }
-# teardown_simple() {
-#     for i in fw0 fw1 fw2 coord0 coord1; do del_if $i; done
-# }
 
 teardown_simple() {
     # Remove veth interfaces
-    for i in fw0 fw1 fw2 coord0 coord1; do
+    for i in fw0 fw1 fw2 coord0 coord1 coord2 coord3; do
         del_if "$i"
     done
 
@@ -564,15 +615,15 @@ do_launch() {
     simple)
         cat << EOF
   # T1 — fw0 (coordinator)
-  sudo ip netns exec fw0_ns python3 main.py --iface fw0 --port 5000 --peer-port 5001 \\
+  sudo ip netns exec fw0_ns python3 main.py --iface fw0 --port 5000 --peer-port 5000 \\
        --topology star --peers-file peers_coord0.json --xdp-mode native --hmac-key \$KEY
 
   # T2 — fw1 (coordinator)
-  sudo ip netns exec fw1_ns python3 main.py --iface fw1 --port 5001 --peer-port 5000 \\
+  sudo ip netns exec fw1_ns python3 main.py --iface fw1 --port 5000 --peer-port 5000 \\
        --topology star --peers-file peers_coord1.json --xdp-mode native --hmac-key \$KEY
 
   # T3 — fw2 (leaf)
-  sudo ip netns exec fw2_ns python3 main.py --iface fw2 --port 5002 --peer-port 5000 \\
+  sudo ip netns exec fw2_ns python3 main.py --iface fw2 --port 5000 --peer-port 5000 \\
        --topology star --peers-file peers_fw2.json --xdp-mode native --hmac-key \$KEY
 
   # T4 — monitor
@@ -745,10 +796,10 @@ _node_cmds() {
 
     case "$t" in
     simple)
-        echo "fw0 ${PY} --iface fw0 --port 5000 --peer-port 5001 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord0.json --xdp-mode native --hmac-key ${KEY}"
-        echo "fw1 ${PY} --iface fw1 --port 5001 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord1.json --xdp-mode native --hmac-key ${KEY}"
-        echo "fw2 ${PY} --iface fw2 --port 5002 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_fw2.json --xdp-mode native --hmac-key ${KEY}"
-        ;;
+        echo "fw0 ip netns exec fw0_ns ${PY} --iface fw0 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord0.json --xdp-mode native --hmac-key ${KEY}"
+        echo "fw1 ip netns exec fw1_ns ${PY} --iface fw1 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord1.json --xdp-mode native --hmac-key ${KEY}"
+        echo "fw2 ip netns exec fw2_ns ${PY} --iface fw2 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_fw2.json --xdp-mode native --hmac-key ${KEY}"
+    ;;
     star-large)
         echo "fw-star-coord ${PY} --iface fw-star-coord --port 6000 --peer-port 6001 --topology star --peers-file ${SCRIPT_DIR_local}/peers_star_coord.json --xdp-mode generic --hmac-key ${KEY}"
         for i in $(seq 0 7); do
