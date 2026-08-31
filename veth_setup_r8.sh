@@ -511,7 +511,6 @@ setup_hierarchical() {
     # -------------------------------------------------------------------------
     for r in 0 1 2; do
         local base
-
         case "$r" in
             0) base=10 ;;
             1) base=20 ;;
@@ -521,17 +520,24 @@ setup_hierarchical() {
         for l in 0 1 2; do
             local leaf="fw-h-r${r}-l${l}"
             local ns="fw-h-r${r}-l${l}_ns"
-            local h=$((l+1))
-            local atk_h=$((h+10))
+
+            # Three separate /30 point-to-point subnets per rack:
+            # leaf0 -> .0/30
+            # leaf1 -> .4/30
+            # leaf2 -> .8/30
+            local subnet=$((l * 4))
+
+            local fw_host=$((subnet + 1))
+            local atk_host=$((subnet + 2))
 
             ensure_namespace "$ns"
 
             make_veth \
                 "$ns" \
                 "$leaf" \
-                "10.30.${base}.${h}/24" \
+                "10.30.${base}.${fw_host}/30" \
                 "atk-h-r${r}-l${l}" \
-                "10.30.${base}.${atk_h}/24"
+                "10.30.${base}.${atk_host}/30"
         done
     done
 
