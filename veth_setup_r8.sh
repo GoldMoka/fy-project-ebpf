@@ -389,82 +389,349 @@ teardown_ring_8() {
     # removes the attacker and backbone interfaces automatically.
     for i in $(seq 0 7); do
         local ns="fw-ring-${i}_ns"
-        if ip netns list | grep -q "^${ns}$"; then
+        if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
             ip netns pids "$ns" | xargs -r kill -9 2>/dev/null || true
             ip netns del "$ns" 2>/dev/null || true
             ok "  Removed $ns"
+            sudo ip -all netns delete
         fi
     done
 }
 
 # =============================================================================
-#  TOPOLOGY: hierarchical
-#  3-tier data-centre hierarchy:
-#    Tier-0 global coordinator: fw-h-global     10.30.0.1  (1 node)
-#    Tier-1 rack coordinators:  fw-h-rack{0,1,2}  10.30.{1,2,3}.1  (3 nodes)
-#    Tier-2 leaf firewalls:     fw-h-r{0,1,2}-l{0,1,2}  (9 nodes)
-#                               rack0 leaves: 10.30.10.{1,2,3}
-#                               rack1 leaves: 10.30.20.{1,2,3}
-#                               rack2 leaves: 10.30.30.{1,2,3}
-#
-#  Block path: leaf → rack-coord → global → other racks → their leaves
-#
-#                fw-h-global (10.30.0.1)
-#              /           |           \
-#         rack0         rack1         rack2
-#        10.30.1.1     10.30.2.1     10.30.3.1
-#       / | \           / | \          / | \
-#    l0 l1 l2        l0 l1 l2       l0 l1 l2
-#  .10.1-.10.3      .20.1-.20.3   .30.1-.30.3
+# TOPOLOGY: hierarchical
 # =============================================================================
-LEAF_BASES=(10 20 30)
+# 
+# 3-tier data-centre hierarchy — 13 FIREWALL NODES
+#
+#                         Global
+#                       10.30.0.1
+#                    /      |      \
+#                   /       |       \
+#              Rack0      Rack1      Rack2
+#           10.30.1.1  10.30.2.1  10.30.3.1
+#            / | \       / | \       / | \
+#           /  |  \     /  |  \     /  |  \
+#         L0  L1  L2   L0  L1  L2   L0  L1  L2
+#
+# Level 0: 1 global coordinator
+# Level 1: 3 rack coordinators
+# Level 2: 9 leaf firewalls
+#
+# Total = 13 firewall namespaces + attacker_ns
+#
+# Firewall namespaces:
+#   fw-h-global_ns
+#   fw-h-rack0_ns fw-h-rack1_ns fw-h-rack2_ns
+#   fw-h-r0-l0_ns ... fw-h-r2-l2_ns
+#
+# Attacker namespace:
+#   attacker_ns
+#
+# Attacker-facing networks:
+#   Global:
+#       10.30.0.1/24  <-> 10.30.0.99/24
+#
+#   Rack 0:
+#       10.30.1.1/24  <-> 10.30.1.99/24
+#
+#   Rack 1:
+#       10.30.2.1/24  <-> 10.30.2.99/24
+#
+#   Rack 2:
+#       10.30.3.1/24  <-> 10.30.3.99/24
+#
+#   Rack 0 leaves:
+#       10.30.10.1/24 <-> 10.30.10.99/24
+#       10.30.10.2/24 <-> 10.30.10.100/24
+#       10.30.10.3/24 <-> 10.30.10.101/24
+#
+#   Rack 1 leaves:
+#       10.30.20.1/24 <-> 10.30.20.99/24
+#       10.30.20.2/24 <-> 10.30.20.100/24
+#       10.30.20.3/24 <-> 10.30.20.101/24
+#
+#   Rack 2 leaves:
+#       10.30.30.1/24 <-> 10.30.30.99/24
+#       10.30.30.2/24 <-> 10.30.30.100/24
+#       10.30.30.3/24 <-> 10.30.30.101/24
+#
+# Hierarchy backbone:
+#
+#   Global <-> Rack0
+#   Global <-> Rack1
+#   Global <-> Rack2
+#
+#   Rack0 <-> Leaf0/1/2
+#   Rack1 <-> Leaf0/1/2
+#   Rack2 <-> Leaf0/1/2
+#
+# 12 namespace-to-namespace backbone links total.
+# =============================================================================
+
 setup_hierarchical() {
-    hdr "hierarchical — global + 3 racks + 9 leaves = 13 nodes"
-    ensure_namespaces
-    # Tier-0: global coordinator (dummy iface — pure relay)
-    if ! ip link show fw-h-global &>/dev/null; then
-        ip link add fw-h-global type dummy 2>/dev/null || true
-        ip addr add 10.30.0.1/16 dev fw-h-global 2>/dev/null || true
-        ip link set fw-h-global up 2>/dev/null || true
-        ok "  fw-h-global (10.30.0.1) global coordinator"
-    fi
-    # Tier-1: rack coordinators
+    hdr "hierarchical — 13 nodes, 3 levels (1→3→9)"
+
+    # -------------------------------------------------------------------------
+    # Shared attacker namespace only.
+    #
+    # Do NOT call ensure_namespaces here.
+    # ensure_namespaces() creates fw0_ns/fw1_ns/fw2_ns for simple topology.
+    # -------------------------------------------------------------------------
+    ensure_namespace "$ATTACKER_NAMESPACE"
+
+    # -------------------------------------------------------------------------
+    # LEVEL 0 — GLOBAL COORDINATOR
+    # -------------------------------------------------------------------------
+    ensure_namespace "fw-h-global_ns"
+
+    make_veth \
+        "fw-h-global_ns" \
+        "fw-h-global" \
+        "10.30.0.1/24" \
+        "atk-h-global" \
+        "10.30.0.99/24"
+
+    # -------------------------------------------------------------------------
+    # LEVEL 1 — RACK COORDINATORS
+    # -------------------------------------------------------------------------
     for r in 0 1 2; do
-        make_veth "fw-h-rack${r}" "10.30.$((r+1)).1/24" "atk-h-rack${r}" "10.30.$((r+1)).99/24"
+        ensure_namespace "fw-h-rack${r}_ns"
+
+        make_veth \
+            "fw-h-rack${r}_ns" \
+            "fw-h-rack${r}" \
+            "10.30.$((r+1)).1/24" \
+            "atk-h-rack${r}" \
+            "10.30.$((r+1)).99/24"
     done
-    # Tier-2: leaves
+
+    # -------------------------------------------------------------------------
+    # LEVEL 2 — LEAF FIREWALLS
+    # -------------------------------------------------------------------------
     for r in 0 1 2; do
-        local base="${LEAF_BASES[$r]}"
+        local base
+
+        case "$r" in
+            0) base=10 ;;
+            1) base=20 ;;
+            2) base=30 ;;
+        esac
+
         for l in 0 1 2; do
+            local leaf="fw-h-r${r}-l${l}"
+            local ns="fw-h-r${r}-l${l}_ns"
             local h=$((l+1))
-            make_veth "fw-h-r${r}-l${l}" "10.30.${base}.${h}/24" \
-                      "atk-h-r${r}-l${l}" "10.30.${base}.$((h+10))/24"
+            local atk_h=$((h+10))
+
+            ensure_namespace "$ns"
+
+            make_veth \
+                "$ns" \
+                "$leaf" \
+                "10.30.${base}.${h}/24" \
+                "atk-h-r${r}-l${l}" \
+                "10.30.${base}.${atk_h}/24"
         done
     done
+
+    # -------------------------------------------------------------------------
+    # HIERARCHY BACKBONE
+    #
+    # 10.31.0.0/30 = global <-> rack0
+    # 10.31.1.0/30 = global <-> rack1
+    # 10.31.2.0/30 = global <-> rack2
+    #
+    # 10.31.10.0/30 = rack0 <-> leaf0
+    # 10.31.11.0/30 = rack0 <-> leaf1
+    # 10.31.12.0/30 = rack0 <-> leaf2
+    #
+    # 10.31.20.0/30 = rack1 <-> leaf0
+    # 10.31.21.0/30 = rack1 <-> leaf1
+    # 10.31.22.0/30 = rack1 <-> leaf2
+    #
+    # 10.31.30.0/30 = rack2 <-> leaf0
+    # 10.31.31.0/30 = rack2 <-> leaf1
+    # 10.31.32.0/30 = rack2 <-> leaf2
+    # -------------------------------------------------------------------------
+
+    # Global <-> Rack0
+    make_backbone \
+        "fw-h-global_ns" "h-g-r0" "10.31.0.1/30" \
+        "fw-h-rack0_ns" "h-r0-g" "10.31.0.2/30"
+
+    # Global <-> Rack1
+    make_backbone \
+        "fw-h-global_ns" "h-g-r1" "10.31.1.1/30" \
+        "fw-h-rack1_ns" "h-r1-g" "10.31.1.2/30"
+
+    # Global <-> Rack2
+    make_backbone \
+        "fw-h-global_ns" "h-g-r2" "10.31.2.1/30" \
+        "fw-h-rack2_ns" "h-r2-g" "10.31.2.2/30"
+
+
+    # -------------------------------------------------------------------------
+    # Rack0 <-> Leaves
+    # -------------------------------------------------------------------------
+    make_backbone \
+        "fw-h-rack0_ns" "h-r0-l0" "10.31.10.1/30" \
+        "fw-h-r0-l0_ns" "h-l0-r0" "10.31.10.2/30"
+
+    make_backbone \
+        "fw-h-rack0_ns" "h-r0-l1" "10.31.11.1/30" \
+        "fw-h-r0-l1_ns" "h-l1-r0" "10.31.11.2/30"
+
+    make_backbone \
+        "fw-h-rack0_ns" "h-r0-l2" "10.31.12.1/30" \
+        "fw-h-r0-l2_ns" "h-l2-r0" "10.31.12.2/30"
+
+
+    # -------------------------------------------------------------------------
+    # Rack1 <-> Leaves
+    # -------------------------------------------------------------------------
+    make_backbone \
+        "fw-h-rack1_ns" "h-r1-l0" "10.31.20.1/30" \
+        "fw-h-r1-l0_ns" "h-l0-r1" "10.31.20.2/30"
+
+    make_backbone \
+        "fw-h-rack1_ns" "h-r1-l1" "10.31.21.1/30" \
+        "fw-h-r1-l1_ns" "h-l1-r1" "10.31.21.2/30"
+
+    make_backbone \
+        "fw-h-rack1_ns" "h-r1-l2" "10.31.22.1/30" \
+        "fw-h-r1-l2_ns" "h-l2-r1" "10.31.22.2/30"
+
+
+    # -------------------------------------------------------------------------
+    # Rack2 <-> Leaves
+    # -------------------------------------------------------------------------
+    make_backbone \
+        "fw-h-rack2_ns" "h-r2-l0" "10.31.30.1/30" \
+        "fw-h-r2-l0_ns" "h-l0-r2" "10.31.30.2/30"
+
+    make_backbone \
+        "fw-h-rack2_ns" "h-r2-l1" "10.31.31.1/30" \
+        "fw-h-r2-l1_ns" "h-l1-r2" "10.31.31.2/30"
+
+    make_backbone \
+        "fw-h-rack2_ns" "h-r2-l2" "10.31.32.1/30" \
+        "fw-h-r2-l2_ns" "h-l2-r2" "10.31.32.2/30"
+
+
+    # -------------------------------------------------------------------------
+    # Networking configuration
+    # -------------------------------------------------------------------------
     sysctl_net
-    # peers files
-    # Global coordinator: role=rack_coordinator but no upstream (it IS the top).
-    # "rack_coordinator" key is intentionally absent — the banner detects this
-    # and prints "(global coordinator — no upstream)" instead of "coordinators=['?']".
+
+    # -------------------------------------------------------------------------
+    # Peer JSON files
+    #
+    # These use backbone IPs because gossip traffic must travel over the
+    # hierarchy links rather than the attacker-facing links.
+    # -------------------------------------------------------------------------
+
+    # Global coordinator
     write_peers "$SCRIPT_DIR/peers_h_global.json" \
-        '{"role":"rack_coordinator","leaves":["10.30.1.1","10.30.2.1","10.30.3.1"]}' 
-    for r in 0 1 2; do
-        local base="${LEAF_BASES[$r]}"
-        write_peers "$SCRIPT_DIR/peers_h_rack${r}.json" \
-            "{\"role\":\"rack_coordinator\",\"rack_coordinator\":\"10.30.0.1\",
-              \"leaves\":[\"10.30.${base}.1\",\"10.30.${base}.2\",\"10.30.${base}.3\"]}"
-        for l in 0 1 2; do
-            write_peers "$SCRIPT_DIR/peers_h_r${r}_l${l}.json" \
-                "{\"role\":\"leaf\",\"rack_coordinator\":\"10.30.$((r+1)).1\"}"
-        done
-    done
-    ok "hierarchical ready — global 10.30.0.1 | racks 10.30.{1,2,3}.1 | leaves 10.30.{10,20,30}.{1,2,3}"
+        '{
+            "role":"rack_coordinator",
+            "leaves":["10.31.0.2","10.31.1.2","10.31.2.2"]
+        }'
+
+    # Rack 0
+    write_peers "$SCRIPT_DIR/peers_h_rack0.json" \
+        '{
+            "role":"rack_coordinator",
+            "rack_coordinator":"10.31.0.1",
+            "leaves":["10.31.10.2","10.31.11.2","10.31.12.2"]
+        }'
+
+    # Rack 1
+    write_peers "$SCRIPT_DIR/peers_h_rack1.json" \
+        '{
+            "role":"rack_coordinator",
+            "rack_coordinator":"10.31.1.1",
+            "leaves":["10.31.20.2","10.31.21.2","10.31.22.2"]
+        }'
+
+    # Rack 2
+    write_peers "$SCRIPT_DIR/peers_h_rack2.json" \
+        '{
+            "role":"rack_coordinator",
+            "rack_coordinator":"10.31.2.1",
+            "leaves":["10.31.30.2","10.31.31.2","10.31.32.2"]
+        }'
+
+    # Rack 0 leaves
+    write_peers "$SCRIPT_DIR/peers_h_r0_l0.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.10.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r0_l1.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.11.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r0_l2.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.12.1"}'
+
+    # Rack 1 leaves
+    write_peers "$SCRIPT_DIR/peers_h_r1_l0.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.20.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r1_l1.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.21.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r1_l2.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.22.1"}'
+
+    # Rack 2 leaves
+    write_peers "$SCRIPT_DIR/peers_h_r2_l0.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.30.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r2_l1.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.31.1"}'
+
+    write_peers "$SCRIPT_DIR/peers_h_r2_l2.json" \
+        '{"role":"leaf","rack_coordinator":"10.31.32.1"}'
+
+    ok "hierarchical ready — 13 firewall namespaces + attacker_ns"
 }
+
+
 teardown_hierarchical() {
-    ip link del fw-h-global 2>/dev/null || true
-    for r in 0 1 2; do
-        del_if "fw-h-rack${r}"
-        for l in 0 1 2; do del_if "fw-h-r${r}-l${l}"; done
+
+    # All firewall interfaces live inside their own namespaces.
+    # Deleting the namespaces removes their attacker/backbone veths.
+
+    local namespaces=(
+        "fw-h-global_ns"
+
+        "fw-h-rack0_ns"
+        "fw-h-rack1_ns"
+        "fw-h-rack2_ns"
+
+        "fw-h-r0-l0_ns"
+        "fw-h-r0-l1_ns"
+        "fw-h-r0-l2_ns"
+
+        "fw-h-r1-l0_ns"
+        "fw-h-r1-l1_ns"
+        "fw-h-r1-l2_ns"
+
+        "fw-h-r2-l0_ns"
+        "fw-h-r2-l1_ns"
+        "fw-h-r2-l2_ns"
+    )
+
+    for ns in "${namespaces[@]}"; do
+        if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
+
+            # Stop anything still running inside the namespace.
+            ip netns pids "$ns" | xargs -r kill -9 2>/dev/null || true
+
+            # Namespace deletion removes all interfaces inside it.
+            ip netns del "$ns" 2>/dev/null || true
+
+            ok "  Removed $ns"
+        fi
     done
 }
 
@@ -683,27 +950,30 @@ EOF
         ;;
     hierarchical)
         echo "  # T1 — global coordinator"
-        echo "  sudo python3 main.py --iface fw-h-global --port 8000 --peer-port 8001 \\"
-        echo "       --topology hierarchical --peers-file peers_h_global.json --xdp-mode generic --hmac-key \$KEY"
+        echo "  sudo ip netns exec fw-h-global_ns python3 main.py --iface fw-h-global --port 8000 --peer-port 8001 \\"
+        echo "       --topology hierarchical --peers-file peers_h_global.json --xdp-mode native --hmac-key \$KEY"
         echo ""
+
         for r in 0 1 2; do
             echo "  # T$((r+2)) — rack coordinator $r"
-            echo "  sudo python3 main.py --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 \\"
+            echo "  sudo ip netns exec fw-h-rack${r}_ns python3 main.py --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 \\"
             echo "       --topology hierarchical --peers-file peers_h_rack${r}.json --xdp-mode native --hmac-key \$KEY"
+            echo ""
         done
-        echo ""
+
         local t=5
         for r in 0 1 2; do
             for l in 0 1 2; do
                 echo "  # T${t} — r${r}-l${l}"
-                echo "  sudo python3 main.py --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) \\"
+                echo "  sudo ip netns exec fw-h-r${r}-l${l}_ns python3 main.py --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) \\"
                 echo "       --topology hierarchical --peers-file peers_h_r${r}_l${l}.json --xdp-mode native --hmac-key \$KEY"
+                echo ""
                 t=$((t+1))
             done
         done
-        echo ""
+
         echo "  # Benchmark a leaf (block traverses: leaf->rack->global->other racks->leaves)"
-        echo "  sudo bash benchmark.sh --iface fw-h-r0-l0 --target 10.30.10.1 --runs 5 --veth --hmac-key \$KEY"
+        echo "  sudo ip netns exec fw-h-r0-l0_ns bash benchmark.sh --iface fw-h-r0-l0 --target 10.30.10.1 --runs 5 --veth --hmac-key \$KEY"
         ;;
     mesh-6)
         for i in $(seq 0 5); do
@@ -835,15 +1105,16 @@ _node_cmds() {
         done
         ;;
     hierarchical)
-        echo "fw-h-global ${PY} --iface fw-h-global --port 8000 --peer-port 8001 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_global.json --xdp-mode generic --hmac-key ${KEY}"
+
+        echo "fw-h-global ip netns exec fw-h-global_ns ${PY} --iface fw-h-global --port 8000 --peer-port 8001 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_global.json --xdp-mode native --hmac-key ${KEY}"
+
         for r in 0 1 2; do
-            echo "fw-h-rack${r} ${PY} --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_rack${r}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-h-rack${r} ip netns exec fw-h-rack${r}_ns ${PY} --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_rack${r}.json --xdp-mode native --hmac-key ${KEY}"
         done
-        local t_idx=0
+
         for r in 0 1 2; do
             for l in 0 1 2; do
-                echo "fw-h-r${r}-l${l} ${PY} --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_r${r}_l${l}.json --xdp-mode native --hmac-key ${KEY}"
-                t_idx=$((t_idx+1))
+                echo "fw-h-r${r}-l${l} ip netns exec fw-h-r${r}-l${l}_ns ${PY} --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_r${r}_l${l}.json --xdp-mode native --hmac-key ${KEY}"
             done
         done
         ;;
