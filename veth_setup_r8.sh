@@ -739,27 +739,57 @@ teardown_hierarchical() {
 # =============================================================================
 setup_mesh_6() {
     hdr "mesh-6 — 6-node full mesh"
-    ensure_namespaces
-    local ips=()
+
+    # Mesh-6 owns only its six firewall namespaces
+    # plus the shared attacker namespace.
+    ensure_namespace "$ATTACKER_NAMESPACE"
+
     for i in $(seq 0 5); do
-        make_veth "fw-mesh-${i}" "10.40.${i}.1/24" "atk-mesh-${i}" "10.40.${i}.99/24"
+        ensure_namespace "fw-mesh-${i}_ns"
+    done
+
+    local ips=()
+
+    for i in $(seq 0 5); do
+        make_veth \
+            "fw-mesh-${i}_ns" \
+            "fw-mesh-${i}" \
+            "10.40.${i}.1/24" \
+            "atk-mesh-${i}" \
+            "10.40.${i}.99/24"
+
         ips+=("10.40.${i}.1")
     done
+
     sysctl_net
+
+    # Every mesh node knows all other five nodes.
     for i in $(seq 0 5); do
         local plist=""
+
         for j in $(seq 0 5); do
             [[ $i -eq $j ]] && continue
             plist="${plist:+$plist,}\"${ips[$j]}\""
         done
+
         write_peers "$SCRIPT_DIR/peers_mesh${i}.json" \
             "{\"role\":\"leaf\",\"topology_hint\":\"mesh\",\"peers\":[${plist}]}"
     done
-    ok "mesh-6 ready — fw-mesh-{0..5} / 10.40.{0..5}.1"
+
+    ok "mesh-6 ready — 6 firewall namespaces + attacker namespace"
 }
+
 teardown_mesh_6() {
-    for i in $(seq 0 5); do del_if "fw-mesh-${i}"; done
+
+    # Delete the six mesh firewall namespaces.
+    for i in $(seq 0 5); do
+        delete_namespace "fw-mesh-${i}_ns"
+    done
+
+    # Mesh-6 uses the shared attacker namespace.
+    delete_namespace "$ATTACKER_NAMESPACE"
 }
+
 
 # =============================================================================
 #  TOPOLOGY: multi-ring
@@ -1020,11 +1050,11 @@ EOF
     mesh-6)
         for i in $(seq 0 5); do
             echo "  # T$((i+1)) — mesh node $i"
-            echo "  sudo python3 main.py --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) \\"
+            echo "  sudo ip netns exec fw-mesh-${i}_ns python3 main.py --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) \\"
             echo "       --topology mesh --peers-file peers_mesh${i}.json --xdp-mode native --hmac-key \$KEY"
         done
         echo ""
-        echo "  sudo bash benchmark.sh --iface fw-mesh-0 --target 10.40.0.1 --runs 5 --veth --hmac-key \$KEY"
+        echo "  sudo ip netns exec fw-mesh-0_ns bash benchmark.sh --iface fw-mesh-0 --target 10.40.0.1 --runs 5 --veth --hmac-key \$KEY"
         ;;
     multi-ring)
         echo "  # T1 — relay (bridges both rings)"
@@ -1162,7 +1192,7 @@ _node_cmds() {
         ;;
     mesh-6)
         for i in $(seq 0 5); do
-            echo "fw-mesh-${i} ${PY} --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-mesh-${i} ip netns exec fw-mesh-${i}_ns ${PY} --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY}"
         done
         ;;
     multi-ring)
