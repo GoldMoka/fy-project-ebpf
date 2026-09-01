@@ -108,7 +108,7 @@ EOF
 fi
 
 # ── Injection setup: veth vs physical ─────────────────────────────────────────
-ATK_NETNS="xdp_attacker"
+ATK_NETNS="attacker_ns"
 INJECT_IFACE="$IFACE"
 INJECT_PREFIX=""
 
