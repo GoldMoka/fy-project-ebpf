@@ -276,20 +276,14 @@ setup_simple() {
 }
 
 teardown_simple() {
-    # Remove veth interfaces
+    # Remove host-side interfaces
     for i in fw0 fw1 fw2 coord0 coord1 coord2 coord3; do
         del_if "$i"
     done
 
-    # Delete network namespaces
+    # Remove namespaces
     for ns in fw0_ns fw1_ns fw2_ns attacker_ns; do
-        if ip netns list | grep -qw "$ns"; then
-            # Kill any remaining processes in the namespace
-            ip netns pids "$ns" | xargs -r kill -9
-
-            # Delete the namespace
-            ip netns del "$ns"
-        fi
+        delete_namespace "$ns"
     done
 }
 
@@ -347,10 +341,12 @@ teardown_star_large() {
 # =============================================================================
 setup_ring_8() {
     hdr "ring-8 — 8-node gossip ring"
-    ensure_namespaces
 
-    # Each firewall gets its own namespace, like the working simple topology.
-    # The attacker-facing interface is also the XDP interface used by main.py.
+    # Ring-8 owns only its 8 firewall namespaces.
+    # attacker_ns is shared, so create only that shared namespace here.
+    ensure_namespace "$ATTACKER_NAMESPACE"
+
+    # Each firewall gets its own namespace
     for i in $(seq 0 7); do
         ensure_namespace "fw-ring-${i}_ns"
         make_veth "fw-ring-${i}_ns" \
@@ -384,18 +380,16 @@ setup_ring_8() {
 
     ok "ring-8 ready — 8 firewall namespaces + 8 attacker links + 8 gossip backbone links"
 }
+
+
 teardown_ring_8() {
-    # Interfaces live inside the firewall namespaces. Deleting the namespaces
-    # removes the attacker and backbone interfaces automatically.
     for i in $(seq 0 7); do
-        local ns="fw-ring-${i}_ns"
-        if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
-            ip netns pids "$ns" | xargs -r kill -9 2>/dev/null || true
-            ip netns del "$ns" 2>/dev/null || true
-            ok "  Removed $ns"
-            sudo ip -all netns delete
-        fi
+        delete_namespace "fw-ring-${i}_ns"
     done
+
+    # attacker_ns is shared with the other topologies.
+    # Only delete it here if ring-8 is intended to own it.
+    delete_namespace "attacker_ns"
 }
 
 # =============================================================================
@@ -704,9 +698,6 @@ setup_hierarchical() {
 
 teardown_hierarchical() {
 
-    # All firewall interfaces live inside their own namespaces.
-    # Deleting the namespaces removes their attacker/backbone veths.
-
     local namespaces=(
         "fw-h-global_ns"
 
@@ -728,17 +719,11 @@ teardown_hierarchical() {
     )
 
     for ns in "${namespaces[@]}"; do
-        if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
-
-            # Stop anything still running inside the namespace.
-            ip netns pids "$ns" | xargs -r kill -9 2>/dev/null || true
-
-            # Namespace deletion removes all interfaces inside it.
-            ip netns del "$ns" 2>/dev/null || true
-
-            ok "  Removed $ns"
-        fi
+        delete_namespace "$ns"
     done
+
+    # Remove the attacker namespace used by hierarchical topology.
+    delete_namespace "$ATTACKER_NAMESPACE"
 }
 
 # =============================================================================
@@ -845,30 +830,81 @@ do_setup() {
     esac
 }
 
+delete_namespace() {
+    local ns="$1"
+
+    if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    fi
+}
+
 do_teardown() {
-    log "Teardown: $1"
-    for iface in $(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+:/{print $2}' \
-                   | grep -E '^(fw|coord)' || true); do
+    local topology="$1"
+
+    log "Teardown: $topology"
+
+    # ---------------------------------------------------------
+    # 1. Detach XDP from interfaces visible in the root namespace
+    # ---------------------------------------------------------
+    for iface in $(ip -o link show 2>/dev/null \
+        | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' \
+        | grep -E '^(fw|coord)' || true); do
+
         ip link set "$iface" xdp off 2>/dev/null || true
     done
-    case "$1" in
-        simple)        teardown_simple ;;
-        star-large)    teardown_star_large ;;
-        ring-8)        teardown_ring_8 ;;
-        hierarchical)  teardown_hierarchical ;;
-        mesh-6)        teardown_mesh_6 ;;
-        multi-ring)    teardown_multi_ring ;;
-        all)
-            teardown_simple; teardown_star_large; teardown_ring_8
-            teardown_hierarchical; teardown_mesh_6; teardown_multi_ring
-            # ip netns del "$NETNS" 2>/dev/null && ok "Removed netns $NETNS" || true ;;
-            for ns in "${FIREWALL_NAMESPACES[@]}"; do
-                ip netns del "$ns" 2>/dev/null || true
-            done
 
-            ip netns del "$ATTACKER_NAMESPACE" 2>/dev/null || true ;;
-        *) die "Unknown topology: $1" ;;
+    # ---------------------------------------------------------
+    # 2. Topology-specific cleanup
+    # ---------------------------------------------------------
+    case "$topology" in
+
+        simple)
+            teardown_simple
+            ;;
+
+        star-large)
+            teardown_star_large
+            ;;
+
+        ring-8)
+            teardown_ring_8
+            ;;
+
+        hierarchical)
+            teardown_hierarchical
+            ;;
+
+        mesh-6)
+            teardown_mesh_6
+            ;;
+
+        multi-ring)
+            teardown_multi_ring
+            ;;
+
+        all)
+            teardown_simple
+            teardown_star_large
+            teardown_ring_8
+            teardown_hierarchical
+            teardown_mesh_6
+            teardown_multi_ring
+            ;;
+
+        *)
+            die "Unknown topology: $topology"
+            ;;
     esac
+
+    # ---------------------------------------------------------
+    # 3. Final cleanup of shared attacker namespace
+    # ---------------------------------------------------------
+    if [[ "$topology" == "all" ]]; then
+        delete_namespace "$ATTACKER_NAMESPACE"
+    fi
+
     ok "Teardown complete."
 }
 
