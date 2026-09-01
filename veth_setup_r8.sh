@@ -1209,11 +1209,17 @@ _node_cmds() {
 
 do_start() {
     local t="$1"
+    local NON_INTERACTIVE=0
+
+    if [[ "${2:-}" == "--non-interactive" ]]; then
+        NON_INTERACTIVE=1
+    fi
+
     [[ "$t" == "all" ]] && die "'start all' is not supported — pick one topology at a time."
 
     # ── Ask for HMAC key ──────────────────────────────────────────────────────
     local KEY=""
-    if [[ -t 0 ]]; then
+    if [[ $NON_INTERACTIVE -eq 0 && -t 0 ]]; then
         echo -e "${CYN}Enter HMAC key (hex, leave empty to auto-generate):${NC}"
         read -r -p "  HMAC key > " KEY
     fi
@@ -1248,11 +1254,17 @@ do_start() {
 
     # Ask whether to use tmux (if available)
     local USE_TMUX=0
+
     if command -v tmux &>/dev/null; then
-        echo ""
-        read -r -p "Use tmux? [Y/n] " ans
-        if [[ "${ans,,}" != "n" ]]; then
+        if [[ $NON_INTERACTIVE -eq 1 ]]; then
             USE_TMUX=1
+            ok "Non-interactive mode: using tmux"
+        else
+            echo ""
+            read -r -p "Use tmux? [Y/n] " ans
+            if [[ "${ans,,}" != "n" ]]; then
+                USE_TMUX=1
+            fi
         fi
     fi
 
@@ -1290,8 +1302,12 @@ do_start() {
         echo ""
         echo -e "  ${GRN}Key for this session: ${KEY}${NC}"
         echo ""
-        read -r -p "Attach to tmux session now? [Y/n] " _ans
-        [[ "${_ans,,}" != "n" ]] && tmux attach -t "$SESSION"
+        if [[ $NON_INTERACTIVE -eq 0 ]]; then
+            read -r -p "Attach to tmux session now? [Y/n] " _ans
+            [[ "${_ans,,}" != "n" ]] && tmux attach -t "$SESSION"
+        else
+            ok "Non-interactive mode: not attaching to tmux"
+        fi
 
     # ── background (no tmux) path ─────────────────────────────────────────────
     else
@@ -1430,7 +1446,7 @@ case "$CMD" in
     setup)     do_setup     "$TOPO" ;;
     teardown)  do_teardown  "$TOPO" ;;
     status)    do_status ;;
-    start)     do_start     "$TOPO" ;;
+    start)     do_start     "$TOPO" "${3:-}" ;;
     stop)      do_stop      "$TOPO" ;;
     launch)    do_launch    "$TOPO" ;;
     benchmark) do_benchmark "$TOPO" ;;
