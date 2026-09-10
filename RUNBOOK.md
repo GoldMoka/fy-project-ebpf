@@ -135,7 +135,8 @@ PART 3 — FUNCTIONAL TESTS (run before benchmarks to confirm everything works)
 
 Only applies to the simple topology (veth_test.sh is wired to fw0/fw1/fw2):
 
-  sudo bash veth_test.sh $KEYTest 1  Balanced SYN+ACK on fw0          → should NOT block
+  sudo bash veth_test.sh $KEY
+  Test 1  Balanced SYN+ACK on fw0          → should NOT block
   Test 2  SYN flood on fw0 (200 SYNs)      → ALERT + block + gossip to fw1/fw2
   Test 3  Adaptive decay on fw1            → score rises then decays
   Test 4  SYN flood on fw2 (leaf)          → coord0 and coord1 both get gossip

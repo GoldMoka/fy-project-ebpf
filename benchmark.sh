@@ -75,7 +75,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$TARGET_IP" ]] && die "Provide --target <IP of device running the firewall>"
-ip link show "$IFACE" &>/dev/null || die "Interface $IFACE not found"
+if ! $VETH_MODE; then
+    ip link show "$IFACE" &>/dev/null || \
+        die "Interface $IFACE not found"
+fi
 mkdir -p "$OUTDIR"
 
 # ── Auto-Detect Gossip Port ───────────────────────────────────────────────────
@@ -108,36 +111,71 @@ EOF
 fi
 
 # ── Injection setup: veth vs physical ─────────────────────────────────────────
-ATK_NETNS="attacker_ns"
+ATK_NETNS=""
+FW_NETNS=""
 INJECT_IFACE="$IFACE"
 INJECT_PREFIX=""
 
 if $VETH_MODE; then
-    if [[ "$IFACE" != fw* ]]; then
-        die "--veth: --iface must start with fw (got: $IFACE). Cannot derive atk* peer name."
-    fi
-    ATK_IFACE="atk${IFACE#fw}"
-    ip netns list | grep -q "^${ATK_NETNS}" || \
-        die "Netns '$ATK_NETNS' not found. Run: sudo bash veth_setup.sh setup <topology>"
+
+    # Current namespaced topology convention:
+    #   fw-mesh-0    -> fw-mesh-0_ns / atk-mesh-0
+    #   fw-ring-0    -> fw-ring-0_ns / atk-ring-0
+    #   fw-h-global -> fw-h-global_ns / corresponding attacker iface
+    #
+    # Derive firewall namespace from the firewall interface.
+    FW_NETNS="${IFACE}_ns"
+
+    # Mesh/ring interfaces are fw-<topology>-<N>
+    # Their attacker-side interface is atk-<topology>-<N>
+    ATK_IFACE="${IFACE/fw-/atk-}"
+
+    ATK_NETNS="attacker_ns"
+
+    # Firewall namespace must exist.
+    ip netns list | awk '{print $1}' | grep -qx "$FW_NETNS" || \
+        die "Firewall netns '$FW_NETNS' not found"
+
+    # Shared attacker namespace must exist.
+    ip netns list | awk '{print $1}' | grep -qx "$ATK_NETNS" || \
+        die "Attacker netns '$ATK_NETNS' not found"
+
+    # Attacker interface must exist in attacker_ns.
     ip netns exec "$ATK_NETNS" ip link show "$ATK_IFACE" &>/dev/null || \
-        die "$ATK_IFACE not found in netns $ATK_NETNS. Run: sudo bash veth_setup.sh status"
-    OWN_IP=$(ip netns exec "$ATK_NETNS" ip -4 addr show "$ATK_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
-    [[ -z "$OWN_IP" ]] && die "No IPv4 on $ATK_IFACE inside $ATK_NETNS"
-    NEXTHOP_MAC=$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null || true)
-    [[ -z "$NEXTHOP_MAC" ]] && die "Cannot read MAC for $IFACE from sysfs"
+        die "$ATK_IFACE not found in $ATK_NETNS"
+
+    OWN_IP=$(ip netns exec "$ATK_NETNS" \
+        ip -4 addr show "$ATK_IFACE" 2>/dev/null |
+        awk '/inet /{print $2}' |
+        cut -d/ -f1 |
+        head -1)
+
+    [[ -n "$OWN_IP" ]] || \
+        die "No IPv4 address on $ATK_IFACE inside $ATK_NETNS"
+
+    # IMPORTANT:
+    # IFACE is inside FW_NETNS, so root /sys/class/net/$IFACE is invalid.
+    NEXTHOP_MAC=$(ip netns exec "$FW_NETNS" \
+        ip link show "$IFACE" |
+        awk '/link\/ether/{print $2}' |
+        head -1)
+
+    [[ -n "$NEXTHOP_MAC" ]] || \
+        die "Cannot read MAC for $IFACE inside $FW_NETNS"
+
     INJECT_IFACE="$ATK_IFACE"
     INJECT_PREFIX="ip netns exec ${ATK_NETNS}"
-    info "Veth mode: ${ATK_NETNS}/${ATK_IFACE} (${OWN_IP}) -> ${IFACE} (${TARGET_IP})"
-    info "Destination MAC: ${NEXTHOP_MAC}"
+
+    info "Firewall : ${FW_NETNS}/${IFACE}"
+    info "Attacker : ${ATK_NETNS}/${ATK_IFACE} (${OWN_IP})"
+    info "Target   : ${TARGET_IP}"
+    info "Dest MAC : ${NEXTHOP_MAC}"
+
 else
-    OWN_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
-    [[ -z "$OWN_IP" ]] && die "No IPv4 on $IFACE"
-    NEXTHOP=$(ip route get "$TARGET_IP" 2>/dev/null | awk '/via/{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}' | head -1)
-    [[ -z "$NEXTHOP" ]] && NEXTHOP="$TARGET_IP"
-    ping -c 2 -W 1 -I "$IFACE" "$NEXTHOP" &>/dev/null || true
-    sleep 0.2
-    NEXTHOP_MAC=$(ip neigh show "$NEXTHOP" dev "$IFACE" 2>/dev/null | awk '/lladdr/{print $3}' | head -1)
-    [[ -z "$NEXTHOP_MAC" ]] && die "Cannot resolve MAC for $NEXTHOP. Run: ping -c3 $NEXTHOP first."
+    OWN_IP=$(ip -4 addr show "$IFACE" 2>/dev/null |
+        awk '/inet /{print $2}' |
+        cut -d/ -f1 |
+        head -1)
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -365,41 +403,76 @@ EOF
 # ── Helper: clear firewall blacklist between benchmarks ───────────────────────
 clear_blacklist() {
     info "Clearing blacklist map..."
-    local _pin="${PIN_BASE}/${IFACE}/blacklist"
-    python3 - "$_pin" << 'EOF'
-import sys, ctypes
-pin_path = sys.argv[1]
+
+    python3 - "$BLACKLIST_MAP_ID" << 'EOF'
+import sys
+import subprocess
+import json
+
+map_id = sys.argv[1]
+
 try:
-    import subprocess, json
-    out = subprocess.check_output(["bpftool", "map", "dump", "pinned", pin_path, "-j"], text=True, stderr=subprocess.DEVNULL)
+    out = subprocess.check_output(
+        ["bpftool", "map", "dump", "id", map_id, "-j"],
+        text=True,
+        stderr=subprocess.DEVNULL
+    )
+
     entries = json.loads(out)
     count = 0
-    for e in entries:
-        kb = e.get("key", [])
-        if kb:
-            subprocess.run(["bpftool", "map", "delete", "pinned", pin_path, "key", "hex"] +[f"{b:02x}" for b in kb], stderr=subprocess.DEVNULL)
-            count += 1
-    print(f"  Cleared {count} blacklist entries (bpftool)")
-except Exception:
-    try:
-        class OG(ctypes.Structure): _fields_=[("pathname",ctypes.c_uint64),("bpf_fd",ctypes.c_uint32),("file_flags",ctypes.c_uint32)]
-        class MO(ctypes.Structure): _fields_=[("map_fd",ctypes.c_uint32),("key",ctypes.c_uint64),("value",ctypes.c_uint64),("flags",ctypes.c_uint64)]
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.syscall.restype = ctypes.c_long
-        buf = ctypes.create_string_buffer(pin_path.encode()+b'\x00')
-        ag = OG(); ag.pathname = ctypes.cast(buf, ctypes.c_void_p).value
-        fd = libc.syscall(321, 7, ctypes.byref(ag), ctypes.sizeof(ag))
-        if fd >= 0:
-            count = 0; nk = ctypes.create_string_buffer(4)
-            attr = MO(); attr.map_fd = fd; attr.key = 0; attr.value = ctypes.cast(nk, ctypes.c_void_p).value
-            while libc.syscall(321, 3, ctypes.byref(attr), ctypes.sizeof(attr)) == 0:
-                da = MO(); da.map_fd = fd; da.key = ctypes.cast(nk, ctypes.c_void_p).value
-                libc.syscall(321, 4, ctypes.byref(da), ctypes.sizeof(da))
-                count += 1; attr.key = 0
-            print(f"  Cleared {count} blacklist entries (ctypes fallback)")
-            import os; os.close(fd)
-    except Exception as e:
-        print(f"  Could not clear blacklist: {e}")
+
+    for entry in entries:
+        key = entry.get("key")
+
+        if not key:
+            continue
+
+        # bpftool JSON may represent key bytes as strings
+        # or as integers. Normalize both forms.
+        if isinstance(key, list):
+            key_hex = []
+
+            for b in key:
+                if isinstance(b, int):
+                    key_hex.append(f"{b:02x}")
+                elif isinstance(b, str):
+                    s = b.strip()
+
+                    # Already a hex byte such as "0a"
+                    if len(s) == 2:
+                        key_hex.append(s.lower())
+                    else:
+                        # Handle decimal representation
+                        key_hex.append(f"{int(s, 0):02x}")
+
+        elif isinstance(key, str):
+            # Handle a hex string such as "0a280063"
+            cleaned = key.replace(" ", "").replace(":", "")
+
+            if len(cleaned) % 2 != 0:
+                continue
+
+            key_hex = [
+                cleaned[i:i+2].lower()
+                for i in range(0, len(cleaned), 2)
+            ]
+
+        else:
+            continue
+
+        subprocess.run(
+            ["bpftool", "map", "delete", "id", map_id,
+             "key", "hex"] + key_hex,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        count += 1
+
+    print(f"  Cleared {count} blacklist entries")
+
+except Exception as e:
+    print(f"  Could not clear blacklist: {e}")
 EOF
 }
 
@@ -410,7 +483,29 @@ cat > /tmp/_bpf_map_access.py << 'MAPEOF'
 import sys, os, socket, struct, ctypes, time
 NR_BPF = 321
 BPF_MAP_LOOKUP_ELEM = 1
-BPF_OBJ_GET        = 7
+BPF_MAP_GET_FD_BY_ID = 14
+
+def _bpf(cmd, attr): return _libc.syscall(NR_BPF, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
+
+def bpf_map_get_fd_by_id(map_id):
+    class BpfAttrMapId(ctypes.Structure):
+        _fields_ = [
+            ("map_id", ctypes.c_uint32),
+            ("next_id", ctypes.c_uint32),
+        ]
+
+    attr = BpfAttrMapId()
+    attr.map_id = int(map_id)
+
+    fd = _bpf(BPF_MAP_GET_FD_BY_ID, attr)
+
+    if fd < 0:
+        raise OSError(
+            ctypes.get_errno(),
+            f"bpf_map_get_fd_by_id({map_id}) failed"
+        )
+
+    return fd
 
 class BpfAttrObjGet(ctypes.Structure):
     _fields_ =[("pathname",   ctypes.c_uint64),("bpf_fd",     ctypes.c_uint32),("file_flags", ctypes.c_uint32)]
@@ -449,8 +544,8 @@ if mode == "lookup_bl":
     print("FOUND" if v is not None else "NOT_FOUND")
 
 elif mode == "poll_bl":
-    pin, ip, tms, ims = sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])
-    fd = bpf_obj_get(pin); t0 = time.perf_counter()
+    map_id, ip, tms, ims = sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])
+    fd = bpf_map_get_fd_by_id(map_id); t0 = time.perf_counter()
     while time.perf_counter() - t0 < tms / 1000:
         if bpf_lookup(fd, ip_key(ip), BL_VSIZE) is not None:
             ms = (time.perf_counter() - t0) * 1000
@@ -459,33 +554,55 @@ elif mode == "poll_bl":
     os.close(fd); print("NOT_FOUND")
 
 elif mode == "lookup_jac":
-    pin, ip, field = sys.argv[2], sys.argv[3], sys.argv[4]
-    fd = bpf_obj_get(pin); v = bpf_lookup(fd, ip_key(ip), JAC_VSIZE); os.close(fd)
-    if v is None: print("NOT_FOUND")
-    else: print(struct.unpack_from("<Q", v, JAC_FIELDS[field])[0])
+    map_id, ip, field = sys.argv[2], sys.argv[3], sys.argv[4]
+    fd = bpf_map_get_fd_by_id(map_id)
+    v = bpf_lookup(fd, ip_key(ip), JAC_VSIZE)
+    os.close(fd)
+
+    if v is None:
+        print("NOT_FOUND")
+    else:
+        print(struct.unpack_from("<Q", v, JAC_FIELDS[field])[0])
 
 elif mode == "poll_jac_score":
-    pin, ip, tms, ims = sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])
-    fd = bpf_obj_get(pin); t0 = time.perf_counter()
+    map_id, ip, tms, ims = sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])
+    fd = bpf_map_get_fd_by_id(map_id)
+    t0 = time.perf_counter()
+
     while time.perf_counter() - t0 < tms / 1000:
         v = bpf_lookup(fd, ip_key(ip), JAC_VSIZE)
+
         if v is not None:
-            score = struct.unpack_from("<Q", v, JAC_FIELDS["score"])[0]
-            if score > 0: os.close(fd); print(score); sys.exit(0)
+            score = struct.unpack_from(
+                "<Q", v, JAC_FIELDS["score"]
+            )[0]
+
+            if score > 0:
+                os.close(fd)
+                print(score)
+                sys.exit(0)
+
         time.sleep(ims / 1000)
-    os.close(fd); print(0)
+
+    os.close(fd)
+    print(0)
 MAPEOF
 
-poll_pinned_blacklist() {
-    python3 /tmp/_bpf_map_access.py poll_bl "$_BL_PIN" "$1" "${2:-2000}" "${3:-5}"
+poll_blacklist_map() {
+    python3 /tmp/_bpf_map_access.py \
+        poll_bl \
+        "$BLACKLIST_MAP_ID" \
+        "$1" \
+        "${2:-2000}" \
+        "${3:-5}"
 }
 
 read_pinned_jac_score() {
-    python3 /tmp/_bpf_map_access.py poll_jac_score "$_JAC_PIN" "$1" "${2:-500}" "5"
+    python3 /tmp/_bpf_map_access.py poll_jac_score "$JAC_MAP_ID" "$1" "${2:-500}" "5"
 }
 
 read_pinned_jac_field() {
-    python3 /tmp/_bpf_map_access.py lookup_jac "$_JAC_PIN" "$1" "$2"
+    python3 /tmp/_bpf_map_access.py lookup_jac "$JAC_MAP_ID" "$1" "$2"
 }
 
 SUMMARY="$OUTDIR/summary_table.txt"
@@ -509,6 +626,59 @@ echo ""
 info "Results will be saved to: $OUTDIR/"
 info "Each benchmark runs $RUNS times for mean ± stddev."
 sleep 1
+
+get_xdp_map_id() {
+    local netns="$1"
+    local iface="$2"
+    local map_name="$3"
+
+    local prog_id
+
+    prog_id=$(
+        ip netns exec "$netns" bpftool net show 2>/dev/null |
+        awk -v iface="$iface" '
+            $1 ~ ("^" iface "\\(") && $2 == "driver" && $3 == "id" {
+                print $4
+                exit
+            }
+        '
+    )
+
+    [[ -n "$prog_id" ]] || return 1
+
+    ip netns exec "$netns" bpftool prog show id "$prog_id" 2>/dev/null |
+        grep -o 'map_ids [0-9,]*' |
+        cut -d' ' -f2 |
+        tr ',' '\n' |
+        while read -r map_id; do
+            if ip netns exec "$netns" \
+                bpftool map show id "$map_id" 2>/dev/null |
+                grep -q "name $map_name"; then
+                echo "$map_id"
+                return 0
+            fi
+        done
+}
+
+
+# ── Discover XDP maps ────────────────────────────────────────
+
+BLACKLIST_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" blacklist)
+
+[[ -n "$BLACKLIST_MAP_ID" ]] || \
+    die "Could not find blacklist map for $IFACE"
+
+info "XDP blacklist map: $BLACKLIST_MAP_ID"
+
+# jac_map will be needed later
+JAC_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" jac_map)
+
+[[ -n "$JAC_MAP_ID" ]] || \
+    die "Could not find jac_map for $IFACE"
+
+info "XDP jac_map: $JAC_MAP_ID"
+
+
 
 # =============================================================================
 # B1 — Packet processing latency
@@ -607,6 +777,19 @@ append_summary "B2  Throughput (Mpps):             $B2_RESULT"
 # =============================================================================
 # B3 — Block detection latency
 # =============================================================================
+
+# BLACKLIST_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" blacklist)
+# JAC_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" jac_map)
+
+# [[ -n "$BLACKLIST_MAP_ID" ]] ||
+#     die "Could not find blacklist map for $IFACE"
+
+# [[ -n "$JAC_MAP_ID" ]] ||
+#     die "Could not find jac_map for $IFACE"
+
+# info "XDP blacklist map: $BLACKLIST_MAP_ID"
+# info "XDP jac_map      : $JAC_MAP_ID"
+
 hdr "B3 — Block detection latency (ms from first SYN to blacklist entry)"
 OUT="$OUTDIR/B3_block_latency.txt"
 echo "B3 — Block detection latency" > "$OUT"
@@ -617,7 +800,7 @@ for i in $(seq 1 $RUNS); do
     PROBE_IP="10.251.${i}.1"
     clear_blacklist
 
-    poll_pinned_blacklist "$PROBE_IP" 3000 2 > /tmp/_b3_poll_${i}.txt &
+    poll_blacklist_map "$PROBE_IP" 3000 2 > /tmp/_b3_poll_${i}.txt &
     POLL_PID=$!
 
     if [[ "$_INJECTOR_TYPE" == "C" ]]; then
@@ -661,7 +844,7 @@ PYEOF
 
     after=""
     if [[ -n "$ms" ]]; then
-        after=$(python3 /tmp/_bpf_map_access.py lookup_jac "$_JAC_PIN" "$PROBE_IP" n_packets 2>/dev/null)
+        after=$(python3 /tmp/_bpf_map_access.py lookup_jac "$JAC_MAP_ID" "$PROBE_IP" n_packets 2>/dev/null)
         if [[ "$after" == "NOT_FOUND" || -z "$after" || "$after" == "0" ]]; then after="6"; fi
     fi
 
@@ -730,51 +913,145 @@ INNEREOF
 
     sleep 0.005
 
-    ht=$(python3 - "$PROBE_IP" "$_JAC_PIN" "$INJECT_PREFIX" "$INJECTOR" "$INJECT_IFACE" "$TARGET_IP" "$NEXTHOP_MAC" "$_INJECTOR_TYPE" << 'PYEOF'
+    ht=$(python3 - "$PROBE_IP" "$JAC_MAP_ID" "$INJECT_PREFIX" "$INJECTOR" "$INJECT_IFACE" "$TARGET_IP" "$NEXTHOP_MAC" "$_INJECTOR_TYPE" << 'PYEOF'
 import sys, os, socket, struct, ctypes, time
-probe_ip=sys.argv[1]; pin_path=sys.argv[2]
-inj_prefix=sys.argv[3]; inj_bin=sys.argv[4]; iface=sys.argv[5]; target=sys.argv[6]; mac=sys.argv[7]; inj_type=sys.argv[8]
-NR_BPF=321; BPF_MAP_LOOKUP_ELEM=1; BPF_OBJ_GET=7
-class OG(ctypes.Structure): _fields_=[("pathname",ctypes.c_uint64),("bpf_fd",ctypes.c_uint32),("file_flags",ctypes.c_uint32)]
-class ML(ctypes.Structure): _fields_=[("map_fd",ctypes.c_uint32),("key",ctypes.c_uint64),("value",ctypes.c_uint64),("flags",ctypes.c_uint64)]
-_libc=ctypes.CDLL("libc.so.6",use_errno=True)
-_libc.syscall.restype=ctypes.c_long
-_libc.syscall.argtypes=[ctypes.c_long,ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
-def _bpf(cmd,a): return _libc.syscall(NR_BPF,cmd,ctypes.byref(a),ctypes.sizeof(a))
-pb=ctypes.create_string_buffer(pin_path.encode()+b'\x00')
-ag=OG(); ag.pathname=ctypes.cast(pb,ctypes.c_void_p).value
-fd=_bpf(BPF_OBJ_GET,ag)
-if fd<0: print(0); sys.exit(0)
-JAC_VSIZE=56; SCORE_OFF=16; ip_bytes=socket.inet_aton(probe_ip)
-def read_score():
-    kbuf=ctypes.create_string_buffer(ip_bytes); vbuf=ctypes.create_string_buffer(JAC_VSIZE)
-    al=ML(); al.map_fd=fd; al.key=ctypes.cast(kbuf,ctypes.c_void_p).value
-    al.value=ctypes.cast(vbuf,ctypes.c_void_p).value; al.flags=0
-    return struct.unpack_from("<Q",bytes(vbuf),SCORE_OFF)[0] if _bpf(BPF_MAP_LOOKUP_ELEM,al)==0 else 0
 
+probe_ip=sys.argv[1]
+map_id=int(sys.argv[2])
+
+inj_prefix=sys.argv[3]
+inj_bin=sys.argv[4]
+iface=sys.argv[5]
+target=sys.argv[6]
+mac=sys.argv[7]
+inj_type=sys.argv[8]
+
+NR_BPF=321
+BPF_MAP_LOOKUP_ELEM=1
+BPF_MAP_GET_FD_BY_ID=14
+
+class MAP_ID(ctypes.Structure):
+    _fields_=[
+        ("map_id", ctypes.c_uint32),
+        ("next_id", ctypes.c_uint32)
+    ]
+
+class ML(ctypes.Structure):
+    _fields_=[
+        ("map_fd", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+        ("flags", ctypes.c_uint64)
+    ]
+
+_libc=ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.syscall.restype=ctypes.c_long
+_libc.syscall.argtypes=[
+    ctypes.c_long,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_uint32
+]
+
+def _bpf(cmd, a):
+    return _libc.syscall(
+        NR_BPF,
+        cmd,
+        ctypes.byref(a),
+        ctypes.sizeof(a)
+    )
+
+# Get FD directly from map ID.
+attr=MAP_ID()
+attr.map_id=map_id
+attr.next_id=0
+
+fd=_bpf(BPF_MAP_GET_FD_BY_ID, attr)
+
+if fd < 0:
+    print(0)
+    sys.exit(0)
+
+JAC_VSIZE=56
+SCORE_OFF=16
+ip_bytes=socket.inet_aton(probe_ip)
+
+def read_score():
+    kbuf=ctypes.create_string_buffer(ip_bytes)
+    vbuf=ctypes.create_string_buffer(JAC_VSIZE)
+
+    al=ML()
+    al.map_fd=fd
+    al.key=ctypes.cast(kbuf, ctypes.c_void_p).value
+    al.value=ctypes.cast(vbuf, ctypes.c_void_p).value
+    al.flags=0
+
+    ret=_bpf(BPF_MAP_LOOKUP_ELEM, al)
+
+    if ret != 0:
+        return 0
+
+    return struct.unpack_from(
+        "<Q",
+        bytes(vbuf),
+        SCORE_OFF
+    )[0]
+
+# Wait for the initial score to appear.
 initial_score=0
+
 for _ in range(100):
     time.sleep(0.005)
     s=read_score()
-    if s>0: initial_score=s; break
-if initial_score==0:
+
+    if s > 0:
+        initial_score=s
+        break
+
+if initial_score == 0:
     sys.stderr.write("  initial score never appeared\n")
-    os.close(fd); print(0); sys.exit(0)
+    os.close(fd)
+    print(0)
+    sys.exit(0)
 
-sys.stderr.write(f"  initial_score={initial_score} (expected ~40)\n")
+sys.stderr.write(
+    f"  initial_score={initial_score} (expected ~40)\n"
+)
 
+# Keep the decay tickle running while we measure decay.
 if inj_type == "C":
-    os.system(f"{inj_prefix} {inj_bin} decay_tickle {iface} {probe_ip} {target} {mac} 8080 6.0 >/dev/null 2>&1 &")
+    os.system(
+        f"{inj_prefix} {inj_bin} decay_tickle "
+        f"{iface} {probe_ip} {target} {mac} 8080 6.0 "
+        f">/dev/null 2>&1 &"
+    )
 
-half=initial_score/2; t0=time.monotonic(); half_time_ms=None
+half=initial_score / 2
+t0=time.monotonic()
+half_time_ms=None
+
 for tick in range(120):
     time.sleep(0.05)
-    sc=read_score(); elapsed=(time.monotonic()-t0)*1000
-    if tick % 5 == 0: sys.stderr.write(f"  t={elapsed:.0f}ms score={sc}/{initial_score}\n")
-    if sc<=half and half_time_ms is None: half_time_ms=elapsed; break
+
+    sc=read_score()
+    elapsed=(time.monotonic()-t0)*1000
+
+    if tick % 5 == 0:
+        sys.stderr.write(
+            f"  t={elapsed:.0f}ms score={sc}/{initial_score}\n"
+        )
+
+    if sc <= half:
+        half_time_ms=elapsed
+        break
+
 os.close(fd)
-if half_time_ms:
-    sys.stderr.write(f"  RESULT: initial={initial_score} half_at={half_time_ms:.1f}ms\n")
+
+if half_time_ms is not None:
+    sys.stderr.write(
+        f"  RESULT: initial={initial_score} "
+        f"half_at={half_time_ms:.1f}ms\n"
+    )
     print(f"{half_time_ms:.1f}")
 else:
     print(0)
@@ -804,7 +1081,7 @@ for i in $(seq 1 $RUNS); do
     GOSSIP_IP="10.249.${i}.1"
     clear_blacklist
 
-    poll_pinned_blacklist "$GOSSIP_IP" 3000 2 > /tmp/_b5_poll_${i}.txt &
+    poll_blacklist_map "$GOSSIP_IP" 3000 2 > /tmp/_b5_poll_${i}.txt &
     POLL_PID=$!
 
     python3 - "$GOSSIP_IP" "$GOSSIP_LISTEN_IP" "$GOSSIP_PORT" "$PEER_PORT" "$HMAC_KEY" << 'PYEOF'

@@ -10,7 +10,6 @@ set -euo pipefail
 # Example:
 #   sudo ./run_experiment.sh mesh-6 xdp
 # ============================================================
-
 TOPOLOGY="${1:-}"
 DEFENSE="${2:-}"
 
@@ -36,6 +35,29 @@ die() {
     exit 1
 }
 
+# ------------------------------------------------------------
+# Parse optional arguments
+# ------------------------------------------------------------
+
+GOSSIP="on"
+
+shift 2 || true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gossip)
+            [[ $# -ge 2 ]] || die "Missing value for --gossip"
+            GOSSIP="$2"
+            shift 2
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+[[ "$GOSSIP" == "on" || "$GOSSIP" == "off" ]] || \
+    die "Gossip must be 'on' or 'off'"
 # ------------------------------------------------------------
 # Argument validation
 # ------------------------------------------------------------
@@ -67,6 +89,7 @@ echo "Experiment:"
 echo "  Topology : $TOPOLOGY"
 echo "  Defense  : $DEFENSE"
 echo "  Results  : $RESULT_DIR"
+echo "  Gossip   : $GOSSIP"
 
 # ------------------------------------------------------------
 # 1. Teardown previous topology
@@ -102,8 +125,7 @@ esac
 
 log "[4/7] Starting ${DEFENSE}"
 
-bash "$VETH_SETUP" start "$TOPOLOGY" --non-interactive
-
+bash "$VETH_SETUP" start "$TOPOLOGY" --non-interactive --gossip "$GOSSIP"
 # ------------------------------------------------------------
 # 5. Verify firewall processes
 # ------------------------------------------------------------
