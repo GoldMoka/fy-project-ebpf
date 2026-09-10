@@ -96,7 +96,13 @@ parser.add_argument("--hmac-key",   default="",
                     help="Hex HMAC-SHA256 key for gossip authentication. "
                          "All nodes in the cluster must share the same key. "
                          "If empty, gossip is unauthenticated (dev/test only).")
+parser.add_argument("--gossip",
+                    choices=["on", "off"],
+                     default="on",
+                    help="Enable or disable gossip propagation")
 args = parser.parse_args()
+
+GOSSIP_ENABLED = (args.gossip == "on")
 
 # ── HMAC-secured gossip channel ────────────────────────────────────────────────
 #
@@ -326,11 +332,16 @@ def _pin_maps():
 # _pin_maps()
 
 # ── Gossip send ────────────────────────────────────────────────────────────────
-_gossip_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_gossip_sock = None
+
+if GOSSIP_ENABLED:
+    _gossip_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _seen_ips    = set()
 _seen_lock   = threading.Lock()
 
 def _send_to(ip, port, payload, label):
+    if not GOSSIP_ENABLED or _gossip_sock is None:
+        return
     try:
         _gossip_sock.sendto(payload, (ip, port))
         print(f"[Gossip] {label} → {ip}:{port}")
@@ -430,6 +441,14 @@ def gossip_listener():
             if not malicious_ip:
                 continue
 
+            # Deduplicate gossip messages.
+            # Once this firewall has processed a block for an IP,
+            # do not apply or propagate the same block again.
+            with _seen_lock:
+                if malicious_ip in _seen_ips:
+                    continue
+                _seen_ips.add(malicious_ip)
+
             print(f"[Gossip] Verified from {addr[0]}: block {malicious_ip}")
             apply_block(malicious_ip)
 
@@ -493,15 +512,23 @@ def handle_event(cpu, data, size):
         rttvar    = int(event.rttvar)
         ALERT_COUNT += 1
 
+        if GOSSIP_ENABLED:
+            action = "XDP_DROP + gossip propagation"
+        else:
+            action = "XDP_DROP + local mitigation"
+
         print(f"\n{'='*60}")
         print(f"  ALERT #{ALERT_COUNT} — IP BLOCKED")
         print(f"  IP         : {ip_str}")
         print(f"  Score      : {score}")
         print(f"  Threshold  : {threshold}  (SRTT={srtt} + 4*RTTVAR={rttvar})")
-        print(f"  Action     : XDP_DROP + gossip propagation")
+        print(f"  Action     : {action}")
         print(f"{'='*60}\n")
 
-        send_gossip(ip_str)
+        if GOSSIP_ENABLED:
+            with _seen_lock:
+                _seen_ips.add(ip_str)
+            send_gossip(ip_str)
 
     except Exception as e:
         print(f"[!] Event handler error: {e}")
@@ -598,8 +625,10 @@ signal.signal(signal.SIGINT,  shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
 # ── Start threads ──────────────────────────────────────────────────────────────
-threading.Thread(target=gossip_listener, daemon=True).start()
-threading.Thread(target=userspace_decay,  daemon=True).start()
+if GOSSIP_ENABLED:
+    threading.Thread(target=gossip_listener, daemon=True).start()
+
+threading.Thread(target=userspace_decay, daemon=True).start()
 threading.Thread(target=print_stats,      daemon=True).start()
 
 b["events"].open_perf_buffer(handle_event)
@@ -639,13 +668,21 @@ else:
                   [peer_config.get("coordinator",
                       peer_config.get("rack_coordinator", "?"))])
     _peers_info = f"coordinators={_coords}"
+
+if GOSSIP_ENABLED:
+    gossip_info = (
+        f"ENABLED — 0.0.0.0:{args.port} "
+        f"(peers on :{args.peer_port})"
+    )
+else:
+    gossip_info = "DISABLED"
 print(f"\n{'='*60}")
 print(f"  XDP Adaptive Firewall — RUNNING")
 print(f"{'='*60}")
 print(f"  Interface : {args.iface}  ({_ip})")
 print(f"  Role      : {MY_ROLE}")
 print(f"  Topology  : {TOPOLOGY}")
-print(f"  Gossip    : 0.0.0.0:{args.port}  (peers on :{args.peer_port})")
+print(f"  Gossip    : {gossip_info}")
 print(f"  XDP mode  : {ATTACHED_MODE.upper()}")
 print(f"  Auth      : {'HMAC-SHA256' if HMAC_KEY else 'NONE (dev mode)'}")
 print(f"  {_peers_info}")

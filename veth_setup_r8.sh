@@ -55,6 +55,11 @@ die()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 CMD="${1:-setup}"
 TOPO="${2:-simple}"
+# GOSSIP="${3:-on}"
+
+# if [[ "$GOSSIP" != "on" && "$GOSSIP" != "off" ]]; then
+#     die "Gossip must be 'on' or 'off'"
+# fi
 # NETNS="xdp_attacker"
 FIREWALL_NAMESPACES=(
     "fw0_ns"
@@ -1154,54 +1159,54 @@ do_benchmark() {
 # Prints one line per node: <iface> <main_py_cmd...>
 # Used by both do_start (to launch) and do_launch (to print).
 _node_cmds() {
-    local t="$1" KEY="$2"
+    local t="$1" KEY="$2" GOSSIP="$3"
     local SCRIPT_DIR_local
     SCRIPT_DIR_local="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local PY="python3 ${SCRIPT_DIR_local}/main.py"
 
     case "$t" in
     simple)
-        echo "fw0 ip netns exec fw0_ns ${PY} --iface fw0 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord0.json --xdp-mode native --hmac-key ${KEY}"
-        echo "fw1 ip netns exec fw1_ns ${PY} --iface fw1 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord1.json --xdp-mode native --hmac-key ${KEY}"
-        echo "fw2 ip netns exec fw2_ns ${PY} --iface fw2 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_fw2.json --xdp-mode native --hmac-key ${KEY}"
+        echo "fw0 ip netns exec fw0_ns ${PY} --iface fw0 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord0.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
+        echo "fw1 ip netns exec fw1_ns ${PY} --iface fw1 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_coord1.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
+        echo "fw2 ip netns exec fw2_ns ${PY} --iface fw2 --port 5000 --peer-port 5000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_fw2.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
     ;;
     star-large)
-        echo "fw-star-coord ${PY} --iface fw-star-coord --port 6000 --peer-port 6001 --topology star --peers-file ${SCRIPT_DIR_local}/peers_star_coord.json --xdp-mode generic --hmac-key ${KEY}"
+        echo "fw-star-coord ${PY} --iface fw-star-coord --port 6000 --peer-port 6001 --topology star --peers-file ${SCRIPT_DIR_local}/peers_star_coord.json --xdp-mode generic --hmac-key ${KEY} --gossip ${GOSSIP}"
         for i in $(seq 0 7); do
-            echo "fw-star-${i} ${PY} --iface fw-star-${i} --port $((6001+i)) --peer-port 6000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_star_leaf${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-star-${i} ${PY} --iface fw-star-${i} --port $((6001+i)) --peer-port 6000 --topology star --peers-file ${SCRIPT_DIR_local}/peers_star_leaf${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         ;;
     ring-8)
         for i in $(seq 0 7); do
-            echo "fw-ring-${i} ip netns exec fw-ring-${i}_ns ${PY} --iface fw-ring-${i} --port $((7000+i)) --peer-port $((7000+(i+1)%8)) --topology ring --peers-file ${SCRIPT_DIR_local}/peers_ring${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-ring-${i} ip netns exec fw-ring-${i}_ns ${PY} --iface fw-ring-${i} --port $((7000+i)) --peer-port $((7000+(i+1)%8)) --topology ring --peers-file ${SCRIPT_DIR_local}/peers_ring${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         ;;
     hierarchical)
 
-        echo "fw-h-global ip netns exec fw-h-global_ns ${PY} --iface fw-h-global --port 8000 --peer-port 8001 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_global.json --xdp-mode native --hmac-key ${KEY}"
+        echo "fw-h-global ip netns exec fw-h-global_ns ${PY} --iface fw-h-global --port 8000 --peer-port 8001 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_global.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
 
         for r in 0 1 2; do
-            echo "fw-h-rack${r} ip netns exec fw-h-rack${r}_ns ${PY} --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_rack${r}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-h-rack${r} ip netns exec fw-h-rack${r}_ns ${PY} --iface fw-h-rack${r} --port $((8001+r)) --peer-port 8000 --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_rack${r}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
 
         for r in 0 1 2; do
             for l in 0 1 2; do
-                echo "fw-h-r${r}-l${l} ip netns exec fw-h-r${r}-l${l}_ns ${PY} --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_r${r}_l${l}.json --xdp-mode native --hmac-key ${KEY}"
+                echo "fw-h-r${r}-l${l} ip netns exec fw-h-r${r}-l${l}_ns ${PY} --iface fw-h-r${r}-l${l} --port $((8010+r*3+l)) --peer-port $((8001+r)) --topology hierarchical --peers-file ${SCRIPT_DIR_local}/peers_h_r${r}_l${l}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
             done
         done
         ;;
     mesh-6)
         for i in $(seq 0 5); do
-            echo "fw-mesh-${i} ip netns exec fw-mesh-${i}_ns ${PY} --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-mesh-${i} ip netns exec fw-mesh-${i}_ns ${PY} --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         ;;
     multi-ring)
-        echo "fw-mr-relay ${PY} --iface fw-mr-relay --port 9100 --peer-port 9101 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_relay.json --xdp-mode native --hmac-key ${KEY}"
+        echo "fw-mr-relay ${PY} --iface fw-mr-relay --port 9100 --peer-port 9101 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_relay.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         for i in 0 1 2 3; do
-            echo "fw-mr-a${i} ${PY} --iface fw-mr-a${i} --port $((9101+i)) --peer-port 9100 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_a${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-mr-a${i} ${PY} --iface fw-mr-a${i} --port $((9101+i)) --peer-port 9100 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_a${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         for i in 0 1 2 3; do
-            echo "fw-mr-b${i} ${PY} --iface fw-mr-b${i} --port $((9110+i)) --peer-port 9100 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_b${i}.json --xdp-mode native --hmac-key ${KEY}"
+            echo "fw-mr-b${i} ${PY} --iface fw-mr-b${i} --port $((9110+i)) --peer-port 9100 --topology ring --peers-file ${SCRIPT_DIR_local}/peers_mr_b${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         ;;
     esac
@@ -1209,11 +1214,37 @@ _node_cmds() {
 
 do_start() {
     local t="$1"
+    shift
+
+    local GOSSIP_MODE="on"
     local NON_INTERACTIVE=0
 
-    if [[ "${2:-}" == "--non-interactive" ]]; then
-        NON_INTERACTIVE=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gossip)
+                if [[ -z "${2:-}" ]]; then
+                    die "--gossip requires 'on' or 'off'"
+                fi
+                GOSSIP_MODE="$2"
+                shift 2
+                ;;
+
+            --non-interactive)
+                NON_INTERACTIVE=1
+                shift
+                ;;
+
+            *)
+                die "Unknown start option: $1"
+                ;;
+        esac
+    done
+
+    if [[ "$GOSSIP_MODE" != "on" && "$GOSSIP_MODE" != "off" ]]; then
+        die "Gossip must be 'on' or 'off'"
     fi
+
+    GOSSIP="$GOSSIP_MODE"
 
     [[ "$t" == "all" ]] && die "'start all' is not supported — pick one topology at a time."
 
@@ -1246,7 +1277,7 @@ do_start() {
     local nodes=()
     while IFS= read -r line; do
         nodes+=("$line")
-    done < <(_node_cmds "$t" "$KEY")
+    done < <(_node_cmds "$t" "$KEY" " $GOSSIP_MODE")
 
     if [[ ${#nodes[@]} -eq 0 ]]; then
         die "No nodes defined for topology '$t'"
@@ -1293,7 +1324,7 @@ do_start() {
 
         echo ""
         ok "All ${#nodes[@]} nodes started in tmux session '${SESSION}'"
-        echo -e "  ${CYN}Attach with: tmux attach -t ${SESSION}${NC}"
+        echo -e "  ${CYN}Attach with: sudo tmux attach -t ${SESSION}${NC}"
         echo -e "  ${CYN}Switch panes: Ctrl-b n (next)  Ctrl-b p (prev)  Ctrl-b w (list)${NC}"
         echo ""
         warn "Wait ~5s for all nodes to compile and attach XDP, then run benchmarks."
@@ -1446,19 +1477,21 @@ case "$CMD" in
     setup)     do_setup     "$TOPO" ;;
     teardown)  do_teardown  "$TOPO" ;;
     status)    do_status ;;
-    start)     do_start     "$TOPO" "${3:-}" ;;
+    start) do_start "$TOPO" "${@:3}" ;;
     stop)      do_stop      "$TOPO" ;;
     launch)    do_launch    "$TOPO" ;;
     benchmark) do_benchmark "$TOPO" ;;
     *)
         die "Unknown command: $CMD
-Usage: sudo bash veth_setup.sh <cmd> [topology]
+Usage: sudo bash veth_setup.sh <cmd> [topology] [gossip]
   cmd:      setup | teardown | status | start | stop | launch | benchmark
   topology: simple | star-large | ring-8 | hierarchical | mesh-6 | multi-ring | all
+  gossip:   on | off
 
 Quickstart (single machine, all veth):
   sudo bash veth_setup.sh setup simple
-  sudo bash veth_setup.sh start simple       ← asks for HMAC key, launches all nodes
+  sudo bash veth_setup.sh start simple on       ← asks for HMAC key, launches all nodes
+  sudo bash veth_setup.sh start simple off       ← asks for HMAC key, launches all nodes
   sudo bash veth_setup.sh stop  simple       ← kills all nodes cleanly
 
 Manual (original behaviour):
