@@ -1145,27 +1145,82 @@ for i in $(seq 1 $TOTAL_IPS); do
 done
 sleep 1
 
-BLOCKED_COUNT=$(python3 - "$_BL_PIN" "$TOTAL_IPS" << 'PYEOF'
-import sys, os, socket, ctypes
-pin_path=sys.argv[1]; total_ips=int(sys.argv[2])
-NR_BPF=321; BPF_MAP_LOOKUP_ELEM=1; BPF_OBJ_GET=7
-class OG(ctypes.Structure): _fields_=[("pathname",ctypes.c_uint64),("bpf_fd",ctypes.c_uint32),("file_flags",ctypes.c_uint32)]
-class ML(ctypes.Structure): _fields_=[("map_fd",ctypes.c_uint32),("key",ctypes.c_uint64),("value",ctypes.c_uint64),("flags",ctypes.c_uint64)]
-_libc=ctypes.CDLL("libc.so.6",use_errno=True)
-_libc.syscall.restype=ctypes.c_long
-_libc.syscall.argtypes=[ctypes.c_long,ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
-pb=ctypes.create_string_buffer(pin_path.encode()+b'\x00')
-ag=OG(); ag.pathname=ctypes.cast(pb,ctypes.c_void_p).value
-fd=_libc.syscall(NR_BPF,BPF_OBJ_GET,ctypes.byref(ag),ctypes.sizeof(ag))
-if fd<0: print(f"  ERROR bpf_obj_get: {ctypes.get_errno()}"); sys.exit(1)
-count=0
-for i in range(1,total_ips+1):
-    ip=f"10.248.1.{i}"; kbuf=ctypes.create_string_buffer(socket.inet_aton(ip)); vbuf=ctypes.create_string_buffer(1)
-    al=ML(); al.map_fd=fd; al.key=ctypes.cast(kbuf,ctypes.c_void_p).value; al.value=ctypes.cast(vbuf,ctypes.c_void_p).value; al.flags=0
-    if _libc.syscall(NR_BPF,BPF_MAP_LOOKUP_ELEM,ctypes.byref(al),ctypes.sizeof(al))==0:
-        count+=1; print(f"  BLOCKED: {ip}")
-os.close(fd)
-print(f"FPR blocked={count} total={total_ips} fpr_pct={count*100/total_ips:.1f}")
+BLOCKED_COUNT=$(python3 - "$BLACKLIST_MAP_ID" "$TOTAL_IPS" << 'PYEOF'
+
+
+import sys
+import ctypes
+
+map_id = int(sys.argv[1])
+total_ips = int(sys.argv[2])
+
+NR_BPF = 321
+BPF_MAP_GET_FD_BY_ID = 14
+BPF_MAP_LOOKUP_ELEM = 1
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+class BpfAttrMapId(ctypes.Structure):
+    _fields_ = [
+        ("map_id", ctypes.c_uint32),
+        ("next_id", ctypes.c_uint32),
+    ]
+
+class BpfAttrLookup(ctypes.Structure):
+    _fields_ = [
+        ("map_fd", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+        ("flags", ctypes.c_uint64),
+    ]
+
+def bpf(cmd, attr):
+    return libc.syscall(
+        NR_BPF,
+        cmd,
+        ctypes.byref(attr),
+        ctypes.sizeof(attr)
+    )
+
+# Get FD directly from the live map ID
+attr = BpfAttrMapId()
+attr.map_id = map_id
+attr.next_id = 0
+
+fd = bpf(BPF_MAP_GET_FD_BY_ID, attr)
+
+if fd < 0:
+    raise OSError(
+        ctypes.get_errno(),
+        f"Failed to get blacklist map FD from ID {map_id}"
+    )
+
+blocked = 0
+
+for i in range(1, total_ips + 1):
+    ip = f"10.248.1.{i}"
+    key = ctypes.create_string_buffer(
+        bytes(map(int, ip.split(".")))
+    )
+    value = ctypes.create_string_buffer(1)
+
+    lookup = BpfAttrLookup()
+    lookup.map_fd = fd
+    lookup.key = ctypes.cast(key, ctypes.c_void_p).value
+    lookup.value = ctypes.cast(value, ctypes.c_void_p).value
+    lookup.flags = 0
+
+    ret = bpf(BPF_MAP_LOOKUP_ELEM, lookup)
+
+    if ret == 0:
+        blocked += 1
+
+libc.close(fd)
+
+fpr = (blocked / total_ips) * 100.0
+
+print(f"fpr_pct={fpr:.2f} blocked={blocked}")
 PYEOF
 )
 
@@ -1263,49 +1318,155 @@ append_summary "B9  Blacklist scalability:"
 
 for SIZE in 0 100 1000 5000; do
     clear_blacklist
+
     if [[ $SIZE -gt 0 ]]; then
         info "  Pre-populating blacklist with $SIZE entries..."
-        python3 - "$SIZE" "$_BL_PIN" << 'PYEOF'
-import sys, os, socket, ctypes
-n = int(sys.argv[1]); pin = sys.argv[2]
-NR_BPF=321; BPF_MAP_UPDATE_ELEM=2; BPF_OBJ_GET=7
-class OG(ctypes.Structure): _fields_=[("pathname",ctypes.c_uint64),("bpf_fd",ctypes.c_uint32),("file_flags",ctypes.c_uint32)]
-class MU(ctypes.Structure): _fields_=[("map_fd",ctypes.c_uint32),("key",ctypes.c_uint64),("value",ctypes.c_uint64),("flags",ctypes.c_uint64)]
-_libc=ctypes.CDLL("libc.so.6",use_errno=True)
-_libc.syscall.restype=ctypes.c_long
-_libc.syscall.argtypes=[ctypes.c_long,ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
-pb=ctypes.create_string_buffer(pin.encode()+b'\x00')
-ag=OG(); ag.pathname=ctypes.cast(pb,ctypes.c_void_p).value
-fd=_libc.syscall(NR_BPF,BPF_OBJ_GET,ctypes.byref(ag),ctypes.sizeof(ag))
-if fd<0: print(f"  ERROR bpf_obj_get: {ctypes.get_errno()}"); sys.exit(1)
-v=ctypes.c_uint8(1)
+
+        python3 - "$SIZE" "$BLACKLIST_MAP_ID" << 'PYEOF'
+import sys
+import os
+import socket
+import ctypes
+
+n = int(sys.argv[1])
+map_id = int(sys.argv[2])
+
+NR_BPF = 321
+BPF_MAP_UPDATE_ELEM = 2
+BPF_MAP_GET_FD_BY_ID = 14
+
+class MAP_ID(ctypes.Structure):
+    _fields_ = [
+        ("map_id", ctypes.c_uint32),
+        ("next_id", ctypes.c_uint32),
+    ]
+
+class MU(ctypes.Structure):
+    _fields_ = [
+        ("map_fd", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+        ("flags", ctypes.c_uint64),
+    ]
+
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.syscall.restype = ctypes.c_long
+_libc.syscall.argtypes = [
+    ctypes.c_long,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+]
+
+# -------------------------------------------------------------------------
+# Get file descriptor directly from the LIVE map ID
+# -------------------------------------------------------------------------
+attr = MAP_ID()
+attr.map_id = map_id
+attr.next_id = 0
+
+fd = _libc.syscall(
+    NR_BPF,
+    BPF_MAP_GET_FD_BY_ID,
+    ctypes.byref(attr),
+    ctypes.sizeof(attr)
+)
+
+if fd < 0:
+    print(
+        f"  ERROR bpf_map_get_fd_by_id({map_id}): "
+        f"{ctypes.get_errno()}"
+    )
+    sys.exit(1)
+
+# -------------------------------------------------------------------------
+# Populate blacklist
+# -------------------------------------------------------------------------
+v = ctypes.c_uint8(1)
+
 for i in range(n):
-    ip=f"192.168.{i//256}.{i%256}"; kb=ctypes.create_string_buffer(socket.inet_aton(ip))
-    au=MU(); au.map_fd=fd; au.key=ctypes.cast(kb,ctypes.c_void_p).value
-    au.value=ctypes.cast(ctypes.byref(v),ctypes.c_void_p).value; au.flags=0
-    _libc.syscall(NR_BPF,BPF_MAP_UPDATE_ELEM,ctypes.byref(au),ctypes.sizeof(au))
-os.close(fd); print(f"  Populated {n} entries")
+    ip = f"192.168.{i // 256}.{i % 256}"
+
+    kb = ctypes.create_string_buffer(
+        socket.inet_aton(ip)
+    )
+
+    au = MU()
+    au.map_fd = fd
+    au.key = ctypes.cast(
+        kb,
+        ctypes.c_void_p
+    ).value
+    au.value = ctypes.cast(
+        ctypes.byref(v),
+        ctypes.c_void_p
+    ).value
+    au.flags = 0
+
+    ret = _libc.syscall(
+        NR_BPF,
+        BPF_MAP_UPDATE_ELEM,
+        ctypes.byref(au),
+        ctypes.sizeof(au)
+    )
+
+    if ret != 0:
+        print(
+            f"  ERROR inserting {ip}: "
+            f"{ctypes.get_errno()}"
+        )
+        os.close(fd)
+        sys.exit(1)
+
+os.close(fd)
+
+print(f"  Populated {n} entries")
 PYEOF
+
     fi
 
     MPPS_VALS=()
+
     for i in $(seq 1 3); do
         PROBE_IP="172.31.${SIZE}.${i}"
+
         if [[ "$_INJECTOR_TYPE" == "C" ]]; then
-            result=$($INJECT_PREFIX "$INJECTOR" throughput "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" "$NEXTHOP_MAC" 8080 3.0 2>/dev/null) || true
+            result=$(
+                $INJECT_PREFIX "$INJECTOR" throughput \
+                    "$INJECT_IFACE" \
+                    "$PROBE_IP" \
+                    "$TARGET_IP" \
+                    "$NEXTHOP_MAC" \
+                    8080 \
+                    3.0 \
+                    2>/dev/null
+            ) || true
         else
-            result=$($INJECT_PREFIX python3 "$INJECTOR" throughput "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" 8080 3.0 2>/dev/null) || true
+            result=$(
+                $INJECT_PREFIX python3 "$INJECTOR" throughput \
+                    "$INJECT_IFACE" \
+                    "$PROBE_IP" \
+                    "$TARGET_IP" \
+                    8080 \
+                    3.0 \
+                    2>/dev/null
+            ) || true
         fi
+
         mpps=$(echo "$result" | awk -F'mpps=' '{print $2}' | awk '{print $1}')
         MPPS_VALS+=("${mpps:-0}")
     done
+
     SCALE_RESULT=$(stats_py "${MPPS_VALS[@]}")
+
     echo "  blacklist_size=$SIZE: $SCALE_RESULT Mpps" | tee -a "$OUT"
     append_summary "    blacklist_size=$SIZE: $SCALE_RESULT Mpps"
+
     sleep 1
 done
 
 clear_blacklist
+
 ok "B9 done"
 
 # =============================================================================
