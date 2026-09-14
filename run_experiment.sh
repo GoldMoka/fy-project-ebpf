@@ -5,13 +5,14 @@ set -euo pipefail
 # run_experiment.sh
 #
 # Usage:
-#   sudo ./run_experiment.sh <topology> <defense>
+#   sudo ./run_experiment.sh <topology> <defense> <attack>
 #
 # Example:
-#   sudo ./run_experiment.sh mesh-6 xdp
+#   sudo ./run_experiment.sh mesh-6 xdp syn-flood
 # ============================================================
 TOPOLOGY="${1:-}"
 DEFENSE="${2:-}"
+ATTACK="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VETH_SETUP="${SCRIPT_DIR}/veth_setup_r8.sh"
@@ -41,7 +42,7 @@ die() {
 
 GOSSIP="on"
 
-shift 2 || true
+shift 3 || true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +67,7 @@ done
 
 [[ -n "$TOPOLOGY" ]] || die "Missing topology."
 [[ -n "$DEFENSE" ]] || die "Missing defense."
+[[ -n "$ATTACK" ]] || die "Missing attack."
 
 case "$TOPOLOGY" in
     mesh-6)
@@ -83,11 +85,19 @@ case "$DEFENSE" in
         ;;
 esac
 
+case "$ATTACK" in
+    syn-flood)
+        ;;
+    *)
+        die "Currently only syn-flood is supported."
+        ;;
+esac
+
 mkdir -p "$RESULT_DIR"
 
-echo "Experiment:"
 echo "  Topology : $TOPOLOGY"
 echo "  Defense  : $DEFENSE"
+echo "  Attack   : $ATTACK"
 echo "  Results  : $RESULT_DIR"
 echo "  Gossip   : $GOSSIP"
 
