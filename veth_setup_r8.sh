@@ -745,15 +745,23 @@ teardown_hierarchical() {
 setup_mesh_6() {
     hdr "mesh-6 — 6-node full mesh"
 
-    # Mesh-6 owns only its six firewall namespaces
-    # plus the shared attacker namespace.
+    # Mesh-6 owns six firewall namespaces + shared attacker namespace.
     ensure_namespace "$ATTACKER_NAMESPACE"
 
     for i in $(seq 0 5); do
         ensure_namespace "fw-mesh-${i}_ns"
     done
 
-    local ips=()
+    # -------------------------------------------------------------------------
+    # Attacker-facing links
+    # -------------------------------------------------------------------------
+    #
+    #   attacker_ns
+    #     |       |       |
+    #    fw0     fw1     fw2 ...
+    #
+    # These remain unchanged.
+    # -------------------------------------------------------------------------
 
     for i in $(seq 0 5); do
         make_veth \
@@ -762,26 +770,77 @@ setup_mesh_6() {
             "10.40.${i}.1/24" \
             "atk-mesh-${i}" \
             "10.40.${i}.99/24"
+    done
 
-        ips+=("10.40.${i}.1")
+    # -------------------------------------------------------------------------
+    # Firewall-to-firewall full-mesh backbone
+    #
+    # 6 nodes -> 15 point-to-point /30 links.
+    #
+    # Link:
+    #   fw0 <-> fw1
+    #   fw0 <-> fw2
+    #   fw0 <-> fw3
+    #   fw0 <-> fw4
+    #   fw0 <-> fw5
+    #   fw1 <-> fw2
+    #   ...
+    #   fw4 <-> fw5
+    #
+    # Backbone networks:
+    #   10.41.0.0/30 ... 10.41.14.0/30
+    # -------------------------------------------------------------------------
+
+    declare -A MESH_PEER_IPS
+    local link=0
+
+    for i in $(seq 0 5); do
+        for j in $(seq $((i + 1)) 5); do
+
+            local subnet="10.41.${link}"
+
+            local iface_i="mesh${i}_${j}"
+            local iface_j="mesh${j}_${i}"
+
+            local ip_i="${subnet}.1/30"
+            local ip_j="${subnet}.2/30"
+
+            make_backbone \
+                "fw-mesh-${i}_ns" "$iface_i" "$ip_i" \
+                "fw-mesh-${j}_ns" "$iface_j" "$ip_j"
+
+            # Save the reachable backbone IP for each peer.
+            MESH_PEER_IPS["${i}_${j}"]="${subnet}.2"
+            MESH_PEER_IPS["${j}_${i}"]="${subnet}.1"
+
+            link=$((link + 1))
+        done
     done
 
     sysctl_net
 
-    # Every mesh node knows all other five nodes.
+    # -------------------------------------------------------------------------
+    # Gossip peer configuration
+    #
+    # Each node gets the BACKBONE IP of every other firewall.
+    # -------------------------------------------------------------------------
+
     for i in $(seq 0 5); do
         local plist=""
 
         for j in $(seq 0 5); do
             [[ $i -eq $j ]] && continue
-            plist="${plist:+$plist,}\"${ips[$j]}\""
+
+            local peer_ip="${MESH_PEER_IPS["${i}_${j}"]}"
+
+            plist="${plist:+$plist,}\"${peer_ip}\""
         done
 
         write_peers "$SCRIPT_DIR/peers_mesh${i}.json" \
             "{\"role\":\"leaf\",\"topology_hint\":\"mesh\",\"peers\":[${plist}]}"
     done
 
-    ok "mesh-6 ready — 6 firewall namespaces + attacker namespace"
+    ok "mesh-6 ready — 6 firewall namespaces + 6 attacker links + 15 gossip backbone links"
 }
 
 teardown_mesh_6() {
@@ -1197,7 +1256,7 @@ _node_cmds() {
         ;;
     mesh-6)
         for i in $(seq 0 5); do
-            echo "fw-mesh-${i} ip netns exec fw-mesh-${i}_ns ${PY} --iface fw-mesh-${i} --port $((9000+i)) --peer-port $((9000+i)) --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
+            echo "fw-mesh-${i} ip netns exec fw-mesh-${i}_ns ${PY} --iface fw-mesh-${i} --port 9000 --peer-port 9000 --topology mesh --peers-file ${SCRIPT_DIR_local}/peers_mesh${i}.json --xdp-mode native --hmac-key ${KEY} --gossip ${GOSSIP}"
         done
         ;;
     multi-ring)
