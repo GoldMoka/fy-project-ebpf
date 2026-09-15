@@ -38,7 +38,9 @@ PEER_PORT=5001
 GOSSIP_LISTEN_IP="127.0.0.1"
 OUTDIR="$(pwd)/results"
 VETH_MODE=false   
-HMAC_KEY=""       
+HMAC_KEY=""  
+
+ATTACK_TYPE="syn-flood"
 
 usage() {
 cat <<EOF
@@ -46,6 +48,7 @@ Usage: sudo bash benchmark.sh [OPTIONS]
 
   --iface       <iface>   Firewall interface XDP is attached to
   --target      <IP>      Firewall IP to send packets toward
+  --attack      <attack>  SYN Flood, Low & Slow etc
   --runs        <N>       Repetitions per benchmark for mean/stddev
   --outdir      <path>    Output directory (default: ./results)
   --hmac-key    <hex>     HMAC-SHA256 key used by main.py
@@ -62,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --iface)       IFACE="$2";            shift 2 ;;
         --target)      TARGET_IP="$2";        shift 2 ;;
+        --attack)       ATTACK_TYPE="$2";     shift 2 ;;
         --runs)        RUNS="$2";             shift 2 ;;
         --outdir)      OUTDIR="$2";           shift 2 ;;
         --hmac-key)    HMAC_KEY="$2";         shift 2 ;;
@@ -322,24 +326,32 @@ STATS_READER="$SCRIPT_DIR/_bench_stats.py"
 cat > "$STATS_READER" << PYEOF
 #!/usr/bin/env python3
 import sys, socket, struct, subprocess
-try: from bcc import BPF
-except ImportError: sys.exit("BCC not found")
-
-DUMMY = r"""
-#include <uapi/linux/bpf.h>
-struct jacobson_t {
-    u64 srtt; u64 rttvar; u64 score; u64 peak;
-    u64 last_ts_ns; u64 window_start; u64 n_packets;
-};
-BPF_HASH(blacklist, u32, u8);
-BPF_HASH(jac_map,   u32, struct jacobson_t);
-int dummy(void *ctx) { return 0; }
-"""
-b  = BPF(text=DUMMY, cflags=["-w"])
-bl = b.get_table("blacklist")
-jm = b.get_table("jac_map")
 
 mode = sys.argv[1]
+
+# Only create the dummy BPF maps for modes that actually need
+# BCC table access. map_memory must NOT create additional maps,
+# because bpftool will then count them in the memory total.
+if mode in ("blacklist_count", "jac_entry"):
+    try:
+        from bcc import BPF
+    except ImportError:
+        sys.exit("BCC not found")
+
+    DUMMY = r"""
+    #include <uapi/linux/bpf.h>
+    struct jacobson_t {
+        u64 srtt; u64 rttvar; u64 score; u64 peak;
+        u64 last_ts_ns; u64 window_start; u64 n_packets;
+    };
+    BPF_HASH(blacklist, u32, u8);
+    BPF_HASH(jac_map,   u32, struct jacobson_t);
+    int dummy(void *ctx) { return 0; }
+    """
+
+    b  = BPF(text=DUMMY, cflags=["-w"])
+    bl = b.get_table("blacklist")
+    jm = b.get_table("jac_map")
 
 if mode == "blacklist_count":
     print(sum(1 for _ in bl.items()))
@@ -627,123 +639,215 @@ info "Results will be saved to: $OUTDIR/"
 info "Each benchmark runs $RUNS times for mean ± stddev."
 sleep 1
 
-get_xdp_map_id() {
-    local netns="$1"
-    local iface="$2"
-    local map_name="$3"
+get_xdp_prog_id() {
+    local iface="$1"
 
-    local prog_id
-
-    prog_id=$(
-        ip netns exec "$netns" bpftool net show 2>/dev/null |
+    bpftool net show 2>/dev/null |
         awk -v iface="$iface" '
             $1 ~ ("^" iface "\\(") && $2 == "driver" && $3 == "id" {
                 print $4
                 exit
             }
-        '
-    )
-
-    [[ -n "$prog_id" ]] || return 1
-
-    ip netns exec "$netns" bpftool prog show id "$prog_id" 2>/dev/null |
-        grep -o 'map_ids [0-9,]*' |
-        cut -d' ' -f2 |
-        tr ',' '\n' |
-        while read -r map_id; do
-            if ip netns exec "$netns" \
-                bpftool map show id "$map_id" 2>/dev/null |
-                grep -q "name $map_name"; then
-                echo "$map_id"
-                return 0
-            fi
-        done
+        ' || true
 }
 
 
-# ── Discover XDP maps ────────────────────────────────────────
+get_xdp_map_id() {
+    local iface="$1"
+    local map_name="$2"
+    local prog_id
+    local map_ids
+    local map_id
 
-BLACKLIST_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" blacklist)
+    prog_id=$(get_xdp_prog_id "$iface")
 
-[[ -n "$BLACKLIST_MAP_ID" ]] || \
+    [[ -n "$prog_id" ]] || return 1
+
+    map_ids=$(
+        bpftool prog show id "$prog_id" 2>/dev/null |
+        sed -n 's/.*map_ids[[:space:]]\+\([0-9,]*\).*/\1/p'
+    )
+
+    [[ -n "$map_ids" ]] || return 1
+
+    IFS=',' read -ra MAP_ARRAY <<< "$map_ids"
+
+    for map_id in "${MAP_ARRAY[@]}"; do
+        if bpftool map show id "$map_id" 2>/dev/null |
+            grep -q "name $map_name"; then
+            echo "$map_id"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
+BLACKLIST_MAP_ID=$(get_xdp_map_id "$IFACE" blacklist) ||
     die "Could not find blacklist map for $IFACE"
 
 info "XDP blacklist map: $BLACKLIST_MAP_ID"
 
-# jac_map will be needed later
-JAC_MAP_ID=$(get_xdp_map_id "$FW_NETNS" "$IFACE" jac_map)
-
-[[ -n "$JAC_MAP_ID" ]] || \
+JAC_MAP_ID=$(get_xdp_map_id "$IFACE" jac_map) ||
     die "Could not find jac_map for $IFACE"
 
 info "XDP jac_map: $JAC_MAP_ID"
 
+XDP_PROG_ID=$(get_xdp_prog_id "$IFACE") ||
+    die "Could not find XDP program for $IFACE"
 
+info "XDP program ID: $XDP_PROG_ID"
 
 # =============================================================================
-# B1 — Packet processing latency
+# B1 — Legitimate TCP Traffic Latency Under Attack
 # =============================================================================
-hdr "B1 — Packet processing latency (per-packet, µs)"
+hdr "B1 — Legitimate TCP traffic latency under attack"
 OUT="$OUTDIR/B1_latency.txt"
-echo "B1 — Packet processing latency" > "$OUT"
+echo "B1 — Legitimate TCP traffic latency under attack" > "$OUT"
 
-if ! command -v hping3 &>/dev/null; then
-    info "hping3 not available — using C injector flood_timed latency measurement."
-    LATENCIES=()
-    for i in $(seq 1 $RUNS); do
-        PROBE_IP="10.253.${i}.1"
-        if [[ "$_INJECTOR_TYPE" == "C" ]]; then
-            $INJECT_PREFIX "$INJECTOR" flood_timed "$INJECT_IFACE" "$PROBE_IP" \
-                         "$TARGET_IP" "$NEXTHOP_MAC" 8080 200 > /tmp/_b1_flood_${i}.txt 2>/dev/null || true
-            lat_us=$(python3 - /tmp/_b1_flood_${i}.txt << 'PYEOF'
+# ---------------------------------------------------------------------------
+# Attack selection
+# ---------------------------------------------------------------------------
+case "$ATTACK_TYPE" in
+    syn-flood)
+        info "B1 attack type: SYN flood"
+        ;;
+    *)
+        die "Unsupported B1 attack type: $ATTACK_TYPE"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# B1 methodology
+#
+# The attack is generated continuously in the background.
+# During the attack, legitimate TCP connection attempts are generated
+# from the attacker's real interface/IP toward the target.
+#
+# The measured quantity is the TCP connection-establishment latency of
+# legitimate traffic, NOT injector send timing and NOT attack-packet RTT.
+# ---------------------------------------------------------------------------
+
+LATENCIES=()
+ATTACK_PIDS=()
+
+for i in $(seq 1 "$RUNS"); do
+    PROBE_IP="10.253.${i}.1"
+
+    info "Run $i/$RUNS: starting $ATTACK_TYPE attack"
+
+    # ---------------------------------------------------------------
+    # Start the selected attack in the background.
+    # ---------------------------------------------------------------
+    case "$ATTACK_TYPE" in
+        syn-flood)
+            if [[ "$_INJECTOR_TYPE" == "C" ]]; then
+                $INJECT_PREFIX "$INJECTOR" throughput \
+                    "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" \
+                    "$NEXTHOP_MAC" 8080 10.0 \
+                    > "/tmp/_b1_attack_${i}.txt" 2>&1 &
+            else
+                $INJECT_PREFIX python3 "$INJECTOR" throughput \
+                    "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" \
+                    "$NEXTHOP_MAC" 8080 10.0 \
+                    > "/tmp/_b1_attack_${i}.txt" 2>&1 &
+            fi
+            ATTACK_PID=$!
+            ;;
+    esac
+
+    ATTACK_PIDS+=("$ATTACK_PID")
+
+    # Give the attack a short head start so that the legitimate
+    # traffic is measured while the defense is actually under load.
+    sleep 1
+
+    # ---------------------------------------------------------------
+    # Generate legitimate TCP connections while attack is running.
+    #
+    # curl measures the TCP connection establishment time through
+    # the target.  We use --connect-timeout so a blocked/degraded
+    # connection does not stall the entire benchmark.
+    # ---------------------------------------------------------------
+    RUN_LATENCIES=()
+
+    info "  Measuring legitimate TCP connection latency..."
+
+    for j in $(seq 1 20); do
+        start_ns=$(date +%s%N)
+
+        if $INJECT_PREFIX curl \
+            --silent \
+            --output /dev/null \
+            --connect-timeout 2 \
+            --max-time 3 \
+            "http://${TARGET_IP}:8080/" \
+            >/dev/null 2>&1; then
+
+            end_ns=$(date +%s%N)
+
+            lat_us=$(
+                python3 - "$start_ns" "$end_ns" << 'PYEOF'
 import sys
-pkts =[]
-try:
-    with open(sys.argv[1]) as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) == 3 and parts[0] == "PKT": pkts.append(float(parts[2]))
-except Exception: pass
-if len(pkts) < 2: print(0)
-else:
-    gaps = [(pkts[j+1]-pkts[j])*1e6 for j in range(len(pkts)-1)]
-    print(f'{sum(gaps)/len(gaps):.3f}')
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+print(f"{(end - start) / 1000.0:.3f}")
 PYEOF
-)
+            )
+
+            RUN_LATENCIES+=("$lat_us")
+            LATENCIES+=("$lat_us")
+
+            info "    legitimate TCP $j: ${lat_us} µs"
         else
-            lat_us=$(python3 -c "import subprocess, re
-out = subprocess.run(['ping','-c','10','-W','1','-I','$INJECT_IFACE','$TARGET_IP'], capture_output=True, text=True).stdout
-m = re.search(r'rtt .* = [\d.]+/([\d.]+)/', out)
-print(f'{float(m.group(1))*1000:.3f}' if m else '0')" 2>/dev/null || echo "0")
+            warn "    legitimate TCP $j: connection failed/timeout"
         fi
-        [[ "$lat_us" != "0" ]] && LATENCIES+=("$lat_us")
-        info "  Run $i: latency ≈ ${lat_us} µs"
-        sleep 0.3
+
+        sleep 0.1
     done
+
+    # ---------------------------------------------------------------
+    # Stop this run's attack.
+    # ---------------------------------------------------------------
+    kill "$ATTACK_PID" 2>/dev/null || true
+    wait "$ATTACK_PID" 2>/dev/null || true
+
+    unset 'ATTACK_PIDS[-1]'
+
+    if [[ ${#RUN_LATENCIES[@]} -gt 0 ]]; then
+        RUN_RESULT=$(stats_py "${RUN_LATENCIES[@]}")
+        info "  Run $i: $RUN_RESULT µs"
+        echo "run=$i attack=$ATTACK_TYPE $RUN_RESULT" >> "$OUT"
+    else
+        warn "  Run $i: no successful legitimate TCP connections"
+        echo "run=$i attack=$ATTACK_TYPE successful_connections=0" >> "$OUT"
+    fi
+
+    sleep 0.5
+done
+
+# ---------------------------------------------------------------------------
+# Cleanup any remaining attack processes.
+# ---------------------------------------------------------------------------
+for pid in "${ATTACK_PIDS[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+done
+
+# ---------------------------------------------------------------------------
+# Overall statistics.
+# ---------------------------------------------------------------------------
+if [[ ${#LATENCIES[@]} -gt 0 ]]; then
     B1_RESULT=$(stats_py "${LATENCIES[@]}")
     echo "$B1_RESULT" >> "$OUT"
-    ok "B1 done (no-hping3 proxy): $B1_RESULT µs"
-    append_summary "B1  Latency (flood_timed proxy µs): $B1_RESULT"
+
+    ok "B1 done: legitimate TCP latency under $ATTACK_TYPE = $B1_RESULT µs"
+    append_summary "B1  Legitimate TCP latency under $ATTACK_TYPE: $B1_RESULT µs"
 else
-    LATENCIES=()
-    for i in $(seq 1 $RUNS); do
-        PROBE_IP="10.253.${i}.1"
-        rtt=$(
-    {
-        hping3 -S -p 8080 -c 20 --fast \
-            -a "$PROBE_IP" -I "$IFACE" "$TARGET_IP" 2>&1 || true
-    } |
-    sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\).*/\2/p'
-)
-        rtt_us=$(python3 -c "print(f'{float(\"${rtt:-0}\")*1000:.1f}')" 2>/dev/null || echo "0")
-        LATENCIES+=("$rtt_us")
-        info "  Run $i: RTT = ${rtt:-N/A} ms  (${rtt_us} µs)"
-        sleep 0.5
-    done
-    B1_RESULT=$(stats_py "${LATENCIES[@]}")
-    echo "$B1_RESULT" >> "$OUT"
-    ok "B1 done: $B1_RESULT µs"
-    append_summary "B1  Per-packet latency (µs):       $B1_RESULT"
+    warn "B1 produced no successful legitimate TCP measurements"
+    echo "No successful legitimate TCP connections" >> "$OUT"
+    append_summary "B1  Legitimate TCP latency under $ATTACK_TYPE: NO_DATA"
 fi
 
 # =============================================================================
@@ -1240,11 +1344,88 @@ echo "B7 — Memory footprint" > "$OUT"
 
 {
     echo "BPF map sizes:"
-    python3 "$STATS_READER" map_memory 2>/dev/null || echo "  (bpftool unavailable — using estimates)"
+
+    # benchmark.sh is already running inside $FW_NETNS.
+    # Discover maps from the currently running XDP program only.
+    if [[ -n "$XDP_PROG_ID" ]]; then
+
+        MAP_IDS=$(bpftool prog show id "$XDP_PROG_ID" 2>/dev/null |
+            sed -n 's/.*map_ids[[:space:]]\+\([0-9,]*\).*/\1/p')
+
+        TOTAL_MAP_MEM=0
+
+        if [[ -n "$MAP_IDS" ]]; then
+            IFS=',' read -ra MAP_ARRAY <<< "$MAP_IDS"
+
+            for MAP_ID in "${MAP_ARRAY[@]}"; do
+
+                MAP_INFO=$(bpftool map show id "$MAP_ID" 2>/dev/null) || continue
+
+                MAP_NAME=$(echo "$MAP_INFO" |
+                    sed -n 's/.*name \([^ ]*\).*/\1/p')
+
+                case "$MAP_NAME" in
+                    blacklist|blacklis|jac_map|events)
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+
+                MAX_ENTRIES=$(echo "$MAP_INFO" |
+                    sed -n 's/.*max_entries \([0-9]*\).*/\1/p')
+
+                KEY_SIZE=$(echo "$MAP_INFO" |
+                    sed -n 's/.*key \([0-9]*\)B.*/\1/p')
+
+                VALUE_SIZE=$(echo "$MAP_INFO" |
+                    sed -n 's/.*value \([0-9]*\)B.*/\1/p')
+
+                MAX_ENTRIES=${MAX_ENTRIES:-0}
+                KEY_SIZE=${KEY_SIZE:-0}
+                VALUE_SIZE=${VALUE_SIZE:-0}
+
+                MAP_MEM=$((MAX_ENTRIES * (KEY_SIZE + VALUE_SIZE)))
+                TOTAL_MAP_MEM=$((TOTAL_MAP_MEM + MAP_MEM))
+
+                printf "  %-12s max_entries=%6d  key=%dB  val=%dB  max_mem=%dKB\n" \
+                    "$MAP_NAME" \
+                    "$MAX_ENTRIES" \
+                    "$KEY_SIZE" \
+                    "$VALUE_SIZE" \
+                    "$((MAP_MEM / 1024))"
+
+            done
+
+            echo "  TOTAL max map memory: $((TOTAL_MAP_MEM / 1024)) KB"
+
+        else
+            echo "  Could not read map IDs from XDP program"
+        fi
+
+    else
+        echo "  XDP program ID unavailable"
+    fi
+
     echo "Userspace RSS:"
     python3 "$STATS_READER" rss 2>/dev/null
-    echo "Kernel BPF program size:"
-    bpftool prog show 2>/dev/null | grep -A3 "xdp_firewall_prog" || echo "  (bpftool unavailable)"
+
+    echo "Kernel BPF program:"
+
+    if [[ -n "$XDP_PROG_ID" ]]; then
+
+        PROG_INFO=$(bpftool prog show id "$XDP_PROG_ID" 2>/dev/null)
+
+        if [[ -n "$PROG_INFO" ]]; then
+            echo "$PROG_INFO" | sed -n '1,3p'
+        else
+            echo "  Could not query XDP program $XDP_PROG_ID"
+        fi
+
+    else
+        echo "  XDP program ID unavailable"
+    fi
+
 } | tee -a "$OUT"
 
 ok "B7 done — see $OUT"
