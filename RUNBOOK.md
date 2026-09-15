@@ -11,23 +11,36 @@ PART 0 — ONE-TIME MACHINE SETUP
 
 Step 0.1  Install all dependencies
 ────────────────────────────────────
-  sudo apt update
-  sudo bash install_and_run.sh --install-only
 
-  Also install benchmark extras:
-  sudo apt install -y bc gcc arping hping3 tmux
+────────────────────────────────
+Manual install each Dependency
+────────────────────────────────
 
-Ubuntu packages `bpftool` as part of the kernel tools package. Install the version that matches your running kernel:
+      sudo apt update
+      sudo bash install_and_run.sh --install-only
 
-  sudo apt install -y linux-tools-$(uname -r)
+    Also install benchmark extras:
+      sudo apt install -y bc gcc arping hping3 tmux
 
-Verify the bpf version
+    Ubuntu packages `bpftool` as part of the kernel tools package. Install the version that matches your running kernel:
 
-  bpftool --version
+      sudo apt install -y linux-tools-$(uname -r)
 
-  Verify kernel headers (required for BPF compilation):
-  ls /lib/modules/$(uname -r)/build
-    → Must exist. If not: sudo apt install linux-headers-$(uname -r)
+    Verify the bpf version
+      bpftool --version
+
+      Verify kernel headers (required for BPF compilation):
+      ls /lib/modules/$(uname -r)/build
+        → Must exist. If not: sudo apt install linux-headers-$(uname -r)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+One Script to install all Dependencies
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  
+
+  chmod +x dependencies.sh
+  ./dependencies.sh
+
 
 Step 0.2  Build the C packet injector
 ──────────────────────────────────────
