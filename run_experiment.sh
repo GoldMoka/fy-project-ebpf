@@ -44,12 +44,18 @@ GOSSIP="on"
 
 shift 3 || true
 
+ONLY_B1=false
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gossip)
             [[ $# -ge 2 ]] || die "Missing value for --gossip"
             GOSSIP="$2"
             shift 2
+            ;;
+        --only-b1)
+            ONLY_B1=true
+            shift
             ;;
         *)
             die "Unknown option: $1"
@@ -153,10 +159,14 @@ pgrep -af "main.py.*fw-mesh" || {
 }
 
 # ------------------------------------------------------------
-# 6. Run throughput measurement
+# 6. Run benchmark
 # ------------------------------------------------------------
 
-log "[6/7] Running throughput benchmark"
+if [[ "$ONLY_B1" == true ]]; then
+    log "[6/7] Running B1 benchmark only"
+else
+    log "[6/7] Running full benchmark"
+fi
 
 mkdir -p "$RESULT_DIR/throughput"
 
@@ -175,13 +185,21 @@ echo "Interface : $IFACE"
 echo "Target    : $TARGET"
 echo "Runs      : 3"
 
-sudo ip netns exec fw-mesh-0_ns bash "${SCRIPT_DIR}/benchmark.sh" \
-    --iface "$IFACE" \
-    --target "$TARGET" \
-    --runs 3 \
-    --veth \
-    --hmac-key "$KEY" \
+BENCHMARK_ARGS=(
+    --iface "$IFACE"
+    --target "$TARGET"
+    --runs 3
+    --veth
+    --hmac-key "$KEY"
     --outdir "$RESULT_DIR/throughput"
+)
+
+if [[ "$ONLY_B1" == true ]]; then
+    BENCHMARK_ARGS+=(--only-b1)
+fi
+
+sudo ip netns exec fw-mesh-0_ns bash "${SCRIPT_DIR}/benchmark.sh" \
+    "${BENCHMARK_ARGS[@]}"
 # ------------------------------------------------------------
 # 7. Save metadata and teardown
 # ------------------------------------------------------------
