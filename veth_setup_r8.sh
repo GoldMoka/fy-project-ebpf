@@ -753,6 +753,15 @@ setup_mesh_6() {
     done
 
     # -------------------------------------------------------------------------
+    # Legitimate-traffic server
+    #
+    # Server is connected only to fw-mesh-0 for the initial B1 experiment.
+    # This keeps Phase 1 isolated to mesh-6 without changing the other
+    # topologies.
+    # -------------------------------------------------------------------------
+    ensure_namespace "server_ns"
+
+    # -------------------------------------------------------------------------
     # Attacker-facing links
     # -------------------------------------------------------------------------
     #
@@ -790,6 +799,43 @@ setup_mesh_6() {
     # Backbone networks:
     #   10.41.0.0/30 ... 10.41.14.0/30
     # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # Legitimate-traffic server link
+    #
+    #   fw-mesh-0_ns
+    #       10.42.0.1/30
+    #           |
+    #           | veth
+    #           |
+    #       server_ns
+    #       10.42.0.2/30
+    # -------------------------------------------------------------------------
+
+    make_backbone \
+        "fw-mesh-0_ns" "server0" "10.42.0.1/30" \
+        "server_ns" "srv0" "10.42.0.2/30"
+
+
+    # -------------------------------------------------------------------------
+    # Routing for legitimate traffic
+    # -------------------------------------------------------------------------
+
+    # Allow attacker_ns to reach the server through fw-mesh-0.
+    ip netns exec "$ATTACKER_NAMESPACE" ip route replace \
+        10.42.0.0/30 via 10.40.0.1 dev atk-mesh-0
+
+    # Allow server replies to return through fw-mesh-0.
+    ip netns exec "server_ns" ip route replace \
+        10.40.0.0/24 via 10.42.0.1 dev srv0
+
+    # fw-mesh-0 must forward packets between its attacker-facing
+    # and server-facing interfaces.
+    ip netns exec "fw-mesh-0_ns" \
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    ip netns exec "fw-mesh-0_ns" \
+        sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 
     declare -A MESH_PEER_IPS
     local link=0
@@ -840,7 +886,7 @@ setup_mesh_6() {
             "{\"role\":\"leaf\",\"topology_hint\":\"mesh\",\"peers\":[${plist}]}"
     done
 
-    ok "mesh-6 ready — 6 firewall namespaces + 6 attacker links + 15 gossip backbone links"
+    ok "mesh-6 ready — 6 firewall namespaces + 6 attacker links + 15 gossip backbone links + server_ns"
 }
 
 teardown_mesh_6() {
@@ -852,6 +898,7 @@ teardown_mesh_6() {
 
     # Mesh-6 uses the shared attacker namespace.
     delete_namespace "$ATTACKER_NAMESPACE"
+    delete_namespace "server_ns"
 }
 
 
