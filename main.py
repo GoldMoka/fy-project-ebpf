@@ -548,7 +548,7 @@ def userspace_decay():
             dt_ms   = int((now_ts - prev_ts) * 1000)
             prev_ts = now_ts
             dt_ms   = min(dt_ms, 1000)
-            df      = dt_ms * DECAY_LAMBDA_PY
+            df      = int(dt_ms * DECAY_LAMBDA_PY)
             if df > 1000:
                 df = 1000
             factor_num = 1000 - df
