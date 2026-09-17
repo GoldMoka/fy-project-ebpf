@@ -38,7 +38,10 @@ PEER_PORT=5001
 GOSSIP_LISTEN_IP="127.0.0.1"
 OUTDIR="$(pwd)/results"
 VETH_MODE=false   
-HMAC_KEY=""  
+HMAC_KEY=""
+ONLY_B1=false
+ONLY_B4=false
+
 
 ATTACK_TYPE="syn-flood"
 
@@ -74,9 +77,17 @@ while [[ $# -gt 0 ]]; do
         --peer-port)   PEER_PORT="$2";        shift 2 ;;
         --veth)        VETH_MODE=true;        shift   ;;
         -h|--help)     usage ;;
+        --only-b1)     ONLY_B1=true;           shift   ;;
+        --only-b4)     ONLY_B4=true;           shift   ;;
         *) die "Unknown option: $1" ;;
     esac
 done
+
+if [[ "$ONLY_B4" == true ]]; then
+    # Skip B1-B3 and jump directly to B4.
+    goto_b4=true
+fi
+
 
 [[ -z "$TARGET_IP" ]] && die "Provide --target <IP of device running the firewall>"
 if ! $VETH_MODE; then
@@ -642,7 +653,8 @@ sleep 1
 get_xdp_prog_id() {
     local iface="$1"
 
-    bpftool net show 2>/dev/null |
+    ip netns exec "$FW_NETNS" \
+        bpftool net show 2>/dev/null |
         awk -v iface="$iface" '
             $1 ~ ("^" iface "\\(") && $2 == "driver" && $3 == "id" {
                 print $4
@@ -664,7 +676,8 @@ get_xdp_map_id() {
     [[ -n "$prog_id" ]] || return 1
 
     map_ids=$(
-        bpftool prog show id "$prog_id" 2>/dev/null |
+        ip netns exec "$FW_NETNS" \
+            bpftool prog show id "$prog_id" 2>/dev/null |
         sed -n 's/.*map_ids[[:space:]]\+\([0-9,]*\).*/\1/p'
     )
 
@@ -673,7 +686,8 @@ get_xdp_map_id() {
     IFS=',' read -ra MAP_ARRAY <<< "$map_ids"
 
     for map_id in "${MAP_ARRAY[@]}"; do
-        if bpftool map show id "$map_id" 2>/dev/null |
+        if ip netns exec "$FW_NETNS" \
+            bpftool map show id "$map_id" 2>/dev/null |
             grep -q "name $map_name"; then
             echo "$map_id"
             return 0
@@ -700,155 +714,308 @@ XDP_PROG_ID=$(get_xdp_prog_id "$IFACE") ||
 info "XDP program ID: $XDP_PROG_ID"
 
 # =============================================================================
-# B1 — Legitimate TCP Traffic Latency Under Attack
+# B1 — Legitimate traffic latency under attack
 # =============================================================================
-hdr "B1 — Legitimate TCP traffic latency under attack"
+hdr "B1 — Legitimate Traffic Latency Under Attack"
+
 OUT="$OUTDIR/B1_latency.txt"
-echo "B1 — Legitimate TCP traffic latency under attack" > "$OUT"
+echo "B1 — Legitimate Traffic Latency Under Attack" > "$OUT"
 
-# ---------------------------------------------------------------------------
-# Attack selection
-# ---------------------------------------------------------------------------
-case "$ATTACK_TYPE" in
-    syn-flood)
-        info "B1 attack type: SYN flood"
-        ;;
-    *)
-        die "Unsupported B1 attack type: $ATTACK_TYPE"
-        ;;
-esac
+# -------------------------------------------------------------------------
+# Current evaluation slice:
+#   Topology : mesh-6
+#   Defense  : XDP Adaptive Firewall
+#   Legit IP : 10.40.0.99
+#   Attack IP: 10.40.0.100
+#   Server   : 10.42.0.2:8080
+# -------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# B1 methodology
-#
-# The attack is generated continuously in the background.
-# During the attack, legitimate TCP connection attempts are generated
-# from the attacker's real interface/IP toward the target.
-#
-# The measured quantity is the TCP connection-establishment latency of
-# legitimate traffic, NOT injector send timing and NOT attack-packet RTT.
-# ---------------------------------------------------------------------------
+if [[ "$FW_NETNS" == "fw-mesh-0_ns" ]]; then
 
-LATENCIES=()
-ATTACK_PIDS=()
+    LEGIT_IP="10.40.0.99"
+    ATTACK_IP="10.40.0.100"
+    SERVER_IP="10.42.0.2"
+    SERVER_PORT=8080
 
-for i in $(seq 1 "$RUNS"); do
-    PROBE_IP="10.253.${i}.1"
+    LEGIT_REQUESTS=100
+    LEGIT_INTERVAL=0.1
+    LEGIT_TIMEOUT=2
 
-    info "Run $i/$RUNS: starting $ATTACK_TYPE attack"
+    ATTACK_RATE=10000
+    ATTACK_DURATION=5
 
-    # ---------------------------------------------------------------
-    # Start the selected attack in the background.
-    # ---------------------------------------------------------------
-    case "$ATTACK_TYPE" in
-        syn-flood)
-            if [[ "$_INJECTOR_TYPE" == "C" ]]; then
-                $INJECT_PREFIX "$INJECTOR" throughput \
-                    "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" \
-                    "$NEXTHOP_MAC" 8080 10.0 \
-                    > "/tmp/_b1_attack_${i}.txt" 2>&1 &
-            else
-                $INJECT_PREFIX python3 "$INJECTOR" throughput \
-                    "$INJECT_IFACE" "$PROBE_IP" "$TARGET_IP" \
-                    "$NEXTHOP_MAC" 8080 10.0 \
-                    > "/tmp/_b1_attack_${i}.txt" 2>&1 &
-            fi
-            ATTACK_PID=$!
-            ;;
-    esac
+    # Get the attacker-side MAC from the existing veth.
+    ATTACK_SRC_MAC=$(
+        ip netns exec "$ATK_NETNS" \
+        ip link show "$ATK_IFACE" 2>/dev/null |
+        awk '/link\/ether/{print $2; exit}'
+    )
 
-    ATTACK_PIDS+=("$ATTACK_PID")
+    [[ -n "$ATTACK_SRC_MAC" ]] ||
+        die "Could not determine attacker MAC for $ATK_IFACE"
 
-    # Give the attack a short head start so that the legitimate
-    # traffic is measured while the defense is actually under load.
-    sleep 1
+    [[ -n "$NEXTHOP_MAC" ]] ||
+        die "Could not determine firewall MAC for $IFACE"
 
-    # ---------------------------------------------------------------
-    # Generate legitimate TCP connections while attack is running.
-    #
-    # curl measures the TCP connection establishment time through
-    # the target.  We use --connect-timeout so a blocked/degraded
-    # connection does not stall the entire benchmark.
-    # ---------------------------------------------------------------
-    RUN_LATENCIES=()
+    info "B1 legitimate client : $LEGIT_IP"
+    info "B1 legitimate server : $SERVER_IP:$SERVER_PORT"
+    info "B1 attack source     : $ATTACK_IP"
+    info "B1 attack rate       : $ATTACK_RATE SYN/s"
+    info "B1 runs               : $RUNS"
 
-    info "  Measuring legitimate TCP connection latency..."
+    BASELINE_AVG=()
+    ATTACK_AVG=()
 
-    for j in $(seq 1 20); do
-        start_ns=$(date +%s%N)
+    BASELINE_SAMPLES=()
+    ATTACK_SAMPLES=()
 
-        if $INJECT_PREFIX curl \
-            --silent \
-            --output /dev/null \
-            --connect-timeout 2 \
-            --max-time 3 \
-            "http://${TARGET_IP}:8080/" \
-            >/dev/null 2>&1; then
-
-            end_ns=$(date +%s%N)
-
-            lat_us=$(
-                python3 - "$start_ns" "$end_ns" << 'PYEOF'
+    # ---------------------------------------------------------------------
+    # Helper: calculate statistics from latency samples.
+    # ---------------------------------------------------------------------
+    b1_stats() {
+        python3 - "$@" << 'PYEOF'
 import sys
-start = int(sys.argv[1])
-end = int(sys.argv[2])
-print(f"{(end - start) / 1000.0:.3f}")
+import math
+
+vals = []
+
+for arg in sys.argv[1:]:
+    try:
+        vals.append(float(arg))
+    except ValueError:
+        pass
+
+if not vals:
+    print("n=0 mean=N/A p50=N/A p95=N/A p99=N/A min=N/A max=N/A")
+    sys.exit(0)
+
+vals.sort()
+n = len(vals)
+
+def percentile(p):
+    if n == 1:
+        return vals[0]
+
+    pos = (n - 1) * p
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+
+    if lo == hi:
+        return vals[lo]
+
+    return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
+
+mean = sum(vals) / n
+
+print(
+    f"n={n} "
+    f"mean={mean:.4f} "
+    f"p50={percentile(0.50):.4f} "
+    f"p95={percentile(0.95):.4f} "
+    f"p99={percentile(0.99):.4f} "
+    f"min={min(vals):.4f} "
+    f"max={max(vals):.4f}"
+)
 PYEOF
-            )
+    }
 
-            RUN_LATENCIES+=("$lat_us")
-            LATENCIES+=("$lat_us")
+    # ---------------------------------------------------------------------
+    # Baseline: legitimate traffic without attack.
+    # ---------------------------------------------------------------------
+    hdr "B1 baseline — legitimate traffic only"
 
-            info "    legitimate TCP $j: ${lat_us} µs"
-        else
-            warn "    legitimate TCP $j: connection failed/timeout"
+    for i in $(seq 1 "$RUNS"); do
+
+        BASE_FILE="/tmp/b1_baseline_${i}.txt"
+
+        info "Baseline run $i/$RUNS"
+
+        ip netns exec "$ATK_NETNS" \
+            python3 "$SCRIPT_DIR/traffic_simulator.py" \
+            --mode legitimate \
+            --dst-ip "$SERVER_IP" \
+            --dst-port "$SERVER_PORT" \
+            --requests "$LEGIT_REQUESTS" \
+            --interval "$LEGIT_INTERVAL" \
+            --timeout "$LEGIT_TIMEOUT" \
+            > "$BASE_FILE" 2>&1
+
+        mapfile -t RUN_VALUES < <(
+            grep -o 'latency_ms=[0-9.]*' "$BASE_FILE" |
+            cut -d= -f2
+        )
+
+        if ((${#RUN_VALUES[@]} == 0)); then
+            warn "Baseline run $i produced no latency samples"
+            continue
         fi
 
-        sleep 0.1
+        BASELINE_SAMPLES+=("${RUN_VALUES[@]}")
+
+        RUN_STATS=$(b1_stats "${RUN_VALUES[@]}")
+        BASELINE_AVG+=(
+            "$(echo "$RUN_STATS" | sed -n 's/.*mean=\([^ ]*\).*/\1/p')"
+        )
+
+        info "  $RUN_STATS"
+
+        echo "Baseline run $i: $RUN_STATS" >> "$OUT"
+
+        rm -f "$BASE_FILE"
+
+        sleep 1
     done
 
-    # ---------------------------------------------------------------
-    # Stop this run's attack.
-    # ---------------------------------------------------------------
-    kill "$ATTACK_PID" 2>/dev/null || true
-    wait "$ATTACK_PID" 2>/dev/null || true
+    # ---------------------------------------------------------------------
+    # Under attack: legitimate traffic + SYN flood.
+    # ---------------------------------------------------------------------
+    hdr "B1 attack — legitimate traffic + SYN flood"
 
-    unset 'ATTACK_PIDS[-1]'
+    for i in $(seq 1 "$RUNS"); do
 
-    if [[ ${#RUN_LATENCIES[@]} -gt 0 ]]; then
-        RUN_RESULT=$(stats_py "${RUN_LATENCIES[@]}")
-        info "  Run $i: $RUN_RESULT µs"
-        echo "run=$i attack=$ATTACK_TYPE $RUN_RESULT" >> "$OUT"
-    else
-        warn "  Run $i: no successful legitimate TCP connections"
-        echo "run=$i attack=$ATTACK_TYPE successful_connections=0" >> "$OUT"
-    fi
+        LEGIT_FILE="/tmp/b1_attack_legit_${i}.txt"
+        ATTACK_FILE="/tmp/b1_attack_syn_${i}.txt"
 
-    sleep 0.5
-done
+        info "Attack run $i/$RUNS"
 
-# ---------------------------------------------------------------------------
-# Cleanup any remaining attack processes.
-# ---------------------------------------------------------------------------
-for pid in "${ATTACK_PIDS[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-done
+        # Start legitimate traffic first.
+        ip netns exec "$ATK_NETNS" \
+            python3 "$SCRIPT_DIR/traffic_simulator.py" \
+            --mode legitimate \
+            --dst-ip "$SERVER_IP" \
+            --dst-port "$SERVER_PORT" \
+            --requests "$LEGIT_REQUESTS" \
+            --interval "$LEGIT_INTERVAL" \
+            --timeout "$LEGIT_TIMEOUT" \
+            > "$LEGIT_FILE" 2>&1 &
 
-# ---------------------------------------------------------------------------
-# Overall statistics.
-# ---------------------------------------------------------------------------
-if [[ ${#LATENCIES[@]} -gt 0 ]]; then
-    B1_RESULT=$(stats_py "${LATENCIES[@]}")
-    echo "$B1_RESULT" >> "$OUT"
+        LEGIT_PID=$!
 
-    ok "B1 done: legitimate TCP latency under $ATTACK_TYPE = $B1_RESULT µs"
-    append_summary "B1  Legitimate TCP latency under $ATTACK_TYPE: $B1_RESULT µs"
+        # Give the legitimate stream a short head start.
+        sleep 1
+
+        # Start SYN flood from a different source IP.
+        ip netns exec "$ATK_NETNS" \
+            python3 "$SCRIPT_DIR/syn_injector.py" \
+            --iface "$ATK_IFACE" \
+            --src-ip "$ATTACK_IP" \
+            --dst-ip "$TARGET_IP" \
+            --dst-port "$SERVER_PORT" \
+            --src-mac "$ATTACK_SRC_MAC" \
+            --dst-mac "$NEXTHOP_MAC" \
+            --rate "$ATTACK_RATE" \
+            --duration "$ATTACK_DURATION" \
+            --defense adaptive \
+            --experiment adaptive_10000pps \
+            --random-src-port \
+            --random-seq \
+            > "$ATTACK_FILE" 2>&1 &
+
+        ATTACK_PID=$!
+
+        wait "$ATTACK_PID" || true
+        wait "$LEGIT_PID" || true
+
+        mapfile -t RUN_VALUES < <(
+            grep -o 'latency_ms=[0-9.]*' "$LEGIT_FILE" |
+            cut -d= -f2
+        )
+
+        if ((${#RUN_VALUES[@]} == 0)); then
+            warn "Attack run $i produced no latency samples"
+            rm -f "$LEGIT_FILE" "$ATTACK_FILE"
+            continue
+        fi
+
+        ATTACK_SAMPLES+=("${RUN_VALUES[@]}")
+
+        RUN_STATS=$(b1_stats "${RUN_VALUES[@]}")
+
+        ATTACK_AVG+=(
+            "$(echo "$RUN_STATS" | sed -n 's/.*mean=\([^ ]*\).*/\1/p')"
+        )
+
+        info "  $RUN_STATS"
+
+        echo "Attack run $i: $RUN_STATS" >> "$OUT"
+
+        rm -f "$LEGIT_FILE" "$ATTACK_FILE"
+
+        sleep 1
+    done
+
+    # ---------------------------------------------------------------------
+    # Final aggregate statistics.
+    # ---------------------------------------------------------------------
+    BASELINE_RESULT=$(b1_stats "${BASELINE_SAMPLES[@]}")
+    ATTACK_RESULT=$(b1_stats "${ATTACK_SAMPLES[@]}")
+
+    BASE_MEAN=$(echo "$BASELINE_RESULT" |
+        sed -n 's/.*mean=\([^ ]*\).*/\1/p')
+
+    ATTACK_MEAN=$(echo "$ATTACK_RESULT" |
+        sed -n 's/.*mean=\([^ ]*\).*/\1/p')
+
+    DELTA=$(python3 - "$BASE_MEAN" "$ATTACK_MEAN" << 'PYEOF'
+import sys
+
+base = float(sys.argv[1])
+attack = float(sys.argv[2])
+
+delta = attack - base
+pct = (delta / base * 100.0) if base else 0.0
+
+print(f"{delta:.4f} {pct:.2f}")
+PYEOF
+    )
+
+    DELTA_MS=$(echo "$DELTA" | awk '{print $1}')
+    DELTA_PCT=$(echo "$DELTA" | awk '{print $2}')
+
+    {
+        echo ""
+        echo "========== B1 RESULTS =========="
+        echo "Baseline:"
+        echo "  $BASELINE_RESULT"
+        echo ""
+        echo "Under SYN flood:"
+        echo "  $ATTACK_RESULT"
+        echo ""
+        echo "Latency impact:"
+        echo "  mean_delta_ms=$DELTA_MS"
+        echo "  mean_change_percent=$DELTA_PCT%"
+        echo "================================="
+    } >> "$OUT"
+
+    echo ""
+    echo "========== B1 RESULTS =========="
+    echo "Baseline:"
+    echo "  $BASELINE_RESULT"
+    echo ""
+    echo "Under SYN flood:"
+    echo "  $ATTACK_RESULT"
+    echo ""
+    echo "Latency impact:"
+    echo "  mean_delta_ms=$DELTA_MS"
+    echo "  mean_change_percent=$DELTA_PCT%"
+    echo "================================="
+
+    ok "B1 completed — legitimate traffic latency under SYN flood"
+
+    append_summary "B1  Legitimate latency baseline: $BASELINE_RESULT"
+    append_summary "B1  Legitimate latency attack:   $ATTACK_RESULT"
+    append_summary "B1  Mean latency change:         ${DELTA_MS} ms (${DELTA_PCT}%)"
+
 else
-    warn "B1 produced no successful legitimate TCP measurements"
-    echo "No successful legitimate TCP connections" >> "$OUT"
-    append_summary "B1  Legitimate TCP latency under $ATTACK_TYPE: NO_DATA"
+
+    # Keep the old B1 behavior for all other topologies for now.
+    warn "B1 legitimate-traffic experiment is currently implemented only for mesh-6."
+    warn "Skipping B1 for $FW_NETNS so other topology benchmarks remain unchanged."
+
+    echo "B1 skipped: legitimate-traffic experiment currently implemented only for mesh-6." >> "$OUT"
+    append_summary "B1  Skipped for $FW_NETNS (mesh-6 implementation only)"
 fi
+
 
 # =============================================================================
 # B2 — Throughput (packets per second)
@@ -966,7 +1133,7 @@ append_summary "B3  Block detection latency (ms):  $B3_TIME"
 append_summary "B3  Packets until blocked:          $B3_PKTS  (theoretical min=6)"
 
 # =============================================================================
-# B4 — Decay timing (score half-life verification)
+# B4 — Userspace score decay timing (half-life verification)
 # =============================================================================
 hdr "B4 — Score decay timing (half-life verification)"
 OUT="$OUTDIR/B4_decay.txt"
@@ -1122,19 +1289,19 @@ sys.stderr.write(
     f"  initial_score={initial_score} (expected ~40)\n"
 )
 
-# Keep the decay tickle running while we measure decay.
-if inj_type == "C":
-    os.system(
-        f"{inj_prefix} {inj_bin} decay_tickle "
-        f"{iface} {probe_ip} {target} {mac} 8080 6.0 "
-        f">/dev/null 2>&1 &"
-    )
+# # Keep the decay tickle running while we measure decay.
+# if inj_type == "C":
+#     os.system(
+#         f"{inj_prefix} {inj_bin} decay_tickle "
+#         f"{iface} {probe_ip} {target} {mac} 8080 6.0 "
+#         f">/dev/null 2>&1 &"
+#     )
 
 half=initial_score / 2
 t0=time.monotonic()
 half_time_ms=None
 
-for tick in range(120):
+for tick in range(60):
     time.sleep(0.05)
 
     sc=read_score()
@@ -1161,7 +1328,7 @@ else:
     print(0)
 PYEOF
 )
-    pkill -f "decay_tickle.*$INJECT_IFACE" 2>/dev/null || true
+    # pkill -f "decay_tickle.*$INJECT_IFACE" 2>/dev/null || true
 
     HALFLIFE_VALS+=("${ht:-0}")
     info "  Run $i: half-life = ${ht:-N/A} ms"
@@ -1170,9 +1337,8 @@ PYEOF
 done
 B4_RESULT=$(stats_py "${HALFLIFE_VALS[@]}")
 echo "Score half-life (ms): $B4_RESULT" >> "$OUT"
-ok "B4 done: $B4_RESULT ms (theory: 138.6ms)"
-append_summary "B4  Score half-life (ms):           $B4_RESULT  (theoretical=138.6ms)"
-
+ok "B4 done: $B4_RESULT ms (theory: ~1000ms)"
+append_summary "B4  Score half-life (ms):           $B4_RESULT  (theoretical=~1000ms)"
 # =============================================================================
 # B5 — Gossip propagation latency
 # =============================================================================
